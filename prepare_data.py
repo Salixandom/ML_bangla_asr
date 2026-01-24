@@ -7,10 +7,12 @@ Features:
 3. Basic statistics
 4. Handle different input formats
 5. Stratified splitting option
+6. **Limit data size for experimentation**
 
 Usage:
     python prepare_data.py --input raw_data.csv --output data/train.csv --valid-ratio 0.1
-    python prepare_data.py --audio-dir data/train --input transcripts.csv --output data/train.csv
+    python prepare_data.py --input raw_data.csv --output data/train.csv --limit 10000
+    python prepare_data.py --input raw_data.csv --output data/train.csv --percentage 5
 """
 
 import argparse
@@ -86,6 +88,49 @@ def load_input_data(input_path: Path, audio_dir: Optional[Path] = None) -> pd.Da
     return df[['id', 'sentence']]
 
 
+def limit_dataset(
+    df: pd.DataFrame,
+    limit: Optional[int] = None,
+    percentage: Optional[float] = None,
+    seed: int = 42
+) -> pd.DataFrame:
+    """
+    Limit dataset size for experimentation.
+    
+    Args:
+        df: Input DataFrame
+        limit: Maximum number of samples (e.g., 10000)
+        percentage: Percentage of data to use (e.g., 5 for 5%)
+        seed: Random seed for reproducibility
+        
+    Returns:
+        Limited DataFrame
+    """
+    if limit is None and percentage is None:
+        return df
+    
+    original_size = len(df)
+    
+    # Calculate target size
+    if percentage is not None:
+        target_size = int(original_size * percentage / 100)
+        print(f"📉 Using {percentage}% of data: {target_size:,} samples")
+    elif limit is not None:
+        target_size = min(limit, original_size)
+        print(f"📉 Limiting to {target_size:,} samples")
+    
+    if target_size >= original_size:
+        print(f"   (No limiting needed, dataset has {original_size:,} samples)")
+        return df
+    
+    # Random sample
+    df_limited = df.sample(n=target_size, random_state=seed).reset_index(drop=True)
+    
+    print(f"   Original: {original_size:,} → Limited: {len(df_limited):,}")
+    
+    return df_limited
+
+
 def validate_audio_files(
     df: pd.DataFrame, 
     audio_dir: Path,
@@ -98,10 +143,20 @@ def validate_audio_files(
         - DataFrame with only valid entries
         - List of missing file IDs
     """
+    try:
+        from tqdm import tqdm
+        use_tqdm = True
+    except ImportError:
+        use_tqdm = False
+    
     valid_ids = []
     missing_ids = []
     
-    for idx, row in df.iterrows():
+    iterator = df.iterrows()
+    if use_tqdm:
+        iterator = tqdm(iterator, total=len(df), desc="Validating audio files")
+    
+    for idx, row in iterator:
         audio_id = row['id']
         found = False
         
@@ -126,25 +181,25 @@ def compute_text_stats(df: pd.DataFrame) -> dict:
     sentences = df['sentence'].tolist()
     
     # Character counts
-    char_counts = [len(s) for s in sentences]
+    char_counts = [len(str(s)) for s in sentences]
     
     # Word counts (split by space)
-    word_counts = [len(s.split()) for s in sentences]
+    word_counts = [len(str(s).split()) for s in sentences]
     
     # Unique characters
-    all_chars = set(''.join(sentences))
+    all_chars = set(''.join(str(s) for s in sentences))
     bangla_chars = set(c for c in all_chars if '\u0980' <= c <= '\u09FF')
     
     stats = {
         'total_samples': len(df),
         'total_characters': sum(char_counts),
         'total_words': sum(word_counts),
-        'avg_chars_per_sample': np.mean(char_counts),
-        'avg_words_per_sample': np.mean(word_counts),
-        'min_chars': min(char_counts),
-        'max_chars': max(char_counts),
-        'min_words': min(word_counts),
-        'max_words': max(word_counts),
+        'avg_chars_per_sample': np.mean(char_counts) if char_counts else 0,
+        'avg_words_per_sample': np.mean(word_counts) if word_counts else 0,
+        'min_chars': min(char_counts) if char_counts else 0,
+        'max_chars': max(char_counts) if char_counts else 0,
+        'min_words': min(word_counts) if word_counts else 0,
+        'max_words': max(word_counts) if word_counts else 0,
         'unique_characters': len(all_chars),
         'unique_bangla_characters': len(bangla_chars),
         'bangla_chars': ''.join(sorted(bangla_chars)),
@@ -155,7 +210,7 @@ def compute_text_stats(df: pd.DataFrame) -> dict:
 
 def split_dataset(
     df: pd.DataFrame,
-    valid_ratio: float = 0.2,
+    valid_ratio: float = 0.1,
     stratify_by_length: bool = False,
     seed: int = 42
 ) -> pd.DataFrame:
@@ -178,20 +233,24 @@ def split_dataset(
     n_valid = int(n_samples * valid_ratio)
     n_train = n_samples - n_valid
     
-    if stratify_by_length:
+    if stratify_by_length and n_samples > 10:
         # Stratify by sentence length (short/medium/long)
         df = df.copy()
-        char_counts = df['sentence'].str.len()
+        char_counts = df['sentence'].astype(str).str.len()
         
         # Create length bins
-        df['_length_bin'] = pd.qcut(char_counts, q=3, labels=['short', 'medium', 'long'])
+        try:
+            df['_length_bin'] = pd.qcut(char_counts, q=3, labels=['short', 'medium', 'long'], duplicates='drop')
+        except ValueError:
+            # Fall back to random if binning fails
+            df['_length_bin'] = 'all'
         
         # Sample from each bin proportionally
         valid_indices = []
-        for bin_name in ['short', 'medium', 'long']:
+        for bin_name in df['_length_bin'].unique():
             bin_indices = df[df['_length_bin'] == bin_name].index.tolist()
             n_bin_valid = max(1, int(len(bin_indices) * valid_ratio))
-            valid_indices.extend(random.sample(bin_indices, n_bin_valid))
+            valid_indices.extend(random.sample(bin_indices, min(n_bin_valid, len(bin_indices))))
         
         df = df.drop(columns=['_length_bin'])
         
@@ -219,6 +278,10 @@ def filter_by_length(
     """Filter samples by text length."""
     original_len = len(df)
     
+    # Convert to string to handle any non-string values
+    df = df.copy()
+    df['sentence'] = df['sentence'].astype(str)
+    
     char_counts = df['sentence'].str.len()
     word_counts = df['sentence'].str.split().str.len()
     
@@ -245,9 +308,6 @@ def remove_duplicates(df: pd.DataFrame) -> pd.DataFrame:
     # Remove duplicate IDs
     df = df.drop_duplicates(subset=['id'], keep='first')
     
-    # Optionally remove duplicate sentences (uncomment if needed)
-    # df = df.drop_duplicates(subset=['sentence'], keep='first')
-    
     df = df.reset_index(drop=True)
     
     removed = original_len - len(df)
@@ -260,6 +320,9 @@ def remove_duplicates(df: pd.DataFrame) -> pd.DataFrame:
 def clean_text(df: pd.DataFrame) -> pd.DataFrame:
     """Basic text cleaning."""
     df = df.copy()
+    
+    # Convert to string
+    df['sentence'] = df['sentence'].astype(str)
     
     # Strip whitespace
     df['sentence'] = df['sentence'].str.strip()
@@ -310,8 +373,9 @@ def print_samples(df: pd.DataFrame, n: int = 5):
     print("-" * 60)
     for idx, row in df.head(n).iterrows():
         split_str = f" [{row['split']}]" if 'split' in df.columns else ""
+        sentence = str(row['sentence'])
         print(f"ID: {row['id']}{split_str}")
-        print(f"   {row['sentence'][:80]}{'...' if len(row['sentence']) > 80 else ''}")
+        print(f"   {sentence[:80]}{'...' if len(sentence) > 80 else ''}")
         print()
 
 
@@ -321,17 +385,23 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-    # Basic split
+    # Basic split (use all data)
     python prepare_data.py --input raw_data.csv --output data/train.csv
     
-    # With validation
-    python prepare_data.py --input raw.csv --output data/train.csv --audio-dir data/train --validate
+    # Limit to 10,000 samples for quick experimentation
+    python prepare_data.py --input raw.csv --output data/train.csv --limit 10000
     
-    # Custom split ratio
-    python prepare_data.py --input raw.csv --output data/train.csv --valid-ratio 0.15
+    # Use only 1% of data (good for initial testing)
+    python prepare_data.py --input raw.csv --output data/train.csv --percentage 1
     
-    # Stratified split
-    python prepare_data.py --input raw.csv --output data/train.csv --stratify
+    # Use 5% with audio validation
+    python prepare_data.py --input raw.csv --output data/train.csv --percentage 5 --audio-dir data/train --validate
+    
+    # Full pipeline: limit + validate + stratify
+    python prepare_data.py --input raw.csv --output data/train.csv --limit 50000 --audio-dir data/train --stratify
+    
+    # Quick test with 1000 samples
+    python prepare_data.py --input raw.csv --output data/train.csv --limit 1000
         """
     )
     
@@ -341,18 +411,33 @@ Examples:
                        help='Output CSV path (e.g., data/train.csv)')
     parser.add_argument('--audio-dir', '-a', type=str, default=None,
                        help='Audio directory to validate files exist')
-    parser.add_argument('--valid-ratio', '-v', type=float, default=0.1,
-                       help='Validation set ratio (default: 0.1 = 10%%)')
-    parser.add_argument('--seed', '-s', type=int, default=42,
-                       help='Random seed (default: 42)')
-    parser.add_argument('--validate', action='store_true',
-                       help='Validate audio files exist')
-    parser.add_argument('--stratify', action='store_true',
-                       help='Stratify split by sentence length')
-    parser.add_argument('--min-chars', type=int, default=1,
-                       help='Minimum characters per sentence')
-    parser.add_argument('--max-chars', type=int, default=500,
-                       help='Maximum characters per sentence')
+    
+    # Data limiting options
+    limit_group = parser.add_argument_group('Data Limiting (for experimentation)')
+    limit_group.add_argument('--limit', '-l', type=int, default=None,
+                            help='Maximum number of samples (e.g., 1000, 10000, 50000)')
+    limit_group.add_argument('--percentage', '-p', type=float, default=None,
+                            help='Percentage of data to use (e.g., 0.1, 1, 5, 10)')
+    
+    # Split options
+    split_group = parser.add_argument_group('Train/Valid Split')
+    split_group.add_argument('--valid-ratio', '-v', type=float, default=0.1,
+                            help='Validation set ratio (default: 0.1 = 10%%)')
+    split_group.add_argument('--stratify', action='store_true',
+                            help='Stratify split by sentence length')
+    split_group.add_argument('--seed', '-s', type=int, default=42,
+                            help='Random seed (default: 42)')
+    
+    # Filter options
+    filter_group = parser.add_argument_group('Filtering')
+    filter_group.add_argument('--min-chars', type=int, default=1,
+                             help='Minimum characters per sentence')
+    filter_group.add_argument('--max-chars', type=int, default=500,
+                             help='Maximum characters per sentence')
+    filter_group.add_argument('--validate', action='store_true',
+                             help='Validate audio files exist')
+    
+    # Output options
     parser.add_argument('--stats-output', type=str, default=None,
                        help='Save statistics to JSON file')
     parser.add_argument('--quiet', '-q', action='store_true',
@@ -367,11 +452,23 @@ Examples:
     # Create output directory
     output_path.parent.mkdir(parents=True, exist_ok=True)
     
+    print(f"{'='*60}")
+    print(f"BANGLA ASR DATA PREPARATION")
+    print(f"{'='*60}")
     print(f"📂 Loading data from: {input_path}")
     
     # Load data
     df = load_input_data(input_path, audio_dir)
     print(f"   Loaded {len(df):,} entries")
+    
+    # Apply data limiting FIRST (before other processing to save time)
+    if args.limit or args.percentage:
+        df = limit_dataset(
+            df, 
+            limit=args.limit, 
+            percentage=args.percentage,
+            seed=args.seed
+        )
     
     # Clean text
     df = clean_text(df)
@@ -432,7 +529,9 @@ Examples:
     # Summary
     train_count = len(df[df['split'] == 'train'])
     valid_count = len(df[df['split'] == 'valid'])
-    print(f"\n✅ Done! Train: {train_count:,} | Valid: {valid_count:,}")
+    print(f"\n{'='*60}")
+    print(f"✅ Done! Train: {train_count:,} | Valid: {valid_count:,}")
+    print(f"{'='*60}")
 
 
 if __name__ == '__main__':

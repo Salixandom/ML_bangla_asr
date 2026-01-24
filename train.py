@@ -495,8 +495,14 @@ class Trainer:
         
         return metrics
     
-    def save_checkpoint(self, name: str):
-        """Save training checkpoint."""
+    def save_checkpoint(self, name: str, keep_latest: int = None):
+        """
+        Save training checkpoint.
+        
+        Args:
+            name: Checkpoint name (e.g., 'best', 'epoch_1', 'step_1000')
+            keep_latest: If set, keep only the latest N epoch checkpoints
+        """
         checkpoint_dir = self.output_dir / name
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
         
@@ -516,6 +522,35 @@ class Trainer:
         self.vocabulary.save(checkpoint_dir / 'vocabulary.json')
         
         print(f"Checkpoint saved to {checkpoint_dir}")
+        
+        # Clean up old epoch checkpoints (keep only latest N)
+        if keep_latest is not None and name.startswith('epoch_'):
+            self._cleanup_old_checkpoints(keep_latest)
+    
+    def _cleanup_old_checkpoints(self, keep_latest: int = 3):
+        """
+        Remove old epoch checkpoints, keeping only the latest N.
+        Never removes 'best' or 'step_*' checkpoints.
+        """
+        import re
+        
+        # Find all epoch checkpoints
+        epoch_checkpoints = []
+        for d in self.output_dir.iterdir():
+            if d.is_dir() and d.name.startswith('epoch_'):
+                match = re.match(r'epoch_(\d+)', d.name)
+                if match:
+                    epoch_num = int(match.group(1))
+                    epoch_checkpoints.append((epoch_num, d))
+        
+        # Sort by epoch number (descending)
+        epoch_checkpoints.sort(key=lambda x: x[0], reverse=True)
+        
+        # Remove old checkpoints
+        for epoch_num, checkpoint_dir in epoch_checkpoints[keep_latest:]:
+            print(f"Removing old checkpoint: {checkpoint_dir.name}")
+            import shutil
+            shutil.rmtree(checkpoint_dir)
     
     def load_checkpoint(self, checkpoint_dir: Path):
         """Load training checkpoint."""
@@ -547,8 +582,24 @@ class Trainer:
             print(f"  Valid WER: {eval_metrics['wer']:.4f}")
             print(f"  Valid CER: {eval_metrics['cer']:.4f}")
             
-            # Save epoch checkpoint
-            self.save_checkpoint(f'epoch_{epoch}')
+            # Log to wandb
+            if self.use_wandb:
+                wandb.log({
+                    'epoch': epoch,
+                    'epoch/train_loss': train_metrics['loss'],
+                    'epoch/valid_wer': eval_metrics['wer'],
+                    'epoch/valid_cer': eval_metrics['cer'],
+                    'epoch/valid_loss': eval_metrics['loss'],
+                })
+            
+            # Save best model if WER improved
+            if eval_metrics['wer'] < self.best_wer:
+                self.best_wer = eval_metrics['wer']
+                self.save_checkpoint('best')
+                print(f"  ✅ New best model saved! WER: {self.best_wer:.4f}")
+            
+            # Save epoch checkpoint (keeps only latest 3)
+            self.save_checkpoint(f'epoch_{epoch}', keep_latest=3)
         
         print(f"\nTraining complete! Best WER: {self.best_wer:.4f}")
 

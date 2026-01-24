@@ -32,9 +32,23 @@ def preprocess_command(args):
     csv_path = Path(args.csv) if args.csv else config.data.train_csv
     output_dir = Path(args.output) if args.output else config.data.processed_dir
     
-    print(f"Preprocessing audio from: {audio_dir}")
-    print(f"Using manifest: {csv_path}")
+    # Determine workers
+    if args.single_thread:
+        num_workers = 1
+    else:
+        num_workers = args.workers  # None = auto-detect
+    
+    use_gpu = not args.no_gpu
+    
+    print(f"{'='*60}")
+    print(f"PREPROCESSING CONFIGURATION")
+    print(f"{'='*60}")
+    print(f"Audio directory: {audio_dir}")
+    print(f"CSV manifest: {csv_path}")
     print(f"Output directory: {output_dir}")
+    print(f"Workers: {num_workers if num_workers else 'auto'}")
+    print(f"GPU acceleration: {use_gpu}")
+    print(f"{'='*60}\n")
     
     preprocess_dataset(
         audio_dir=audio_dir,
@@ -42,10 +56,11 @@ def preprocess_command(args):
         output_dir=output_dir,
         audio_config=config.audio,
         vad_config=config.vad,
-        num_workers=args.workers
+        num_workers=num_workers,
+        use_gpu=use_gpu
     )
     
-    print("\nPreprocessing complete!")
+    print("\n✅ Preprocessing complete!")
 
 
 def prepare_command(args):
@@ -66,6 +81,13 @@ def prepare_command(args):
     
     if args.stratify:
         cmd.append('--stratify')
+    
+    # Data limiting options
+    if args.limit:
+        cmd.extend(['--limit', str(args.limit)])
+    
+    if args.percentage:
+        cmd.extend(['--percentage', str(args.percentage)])
     
     print(f"Running: {' '.join(cmd)}")
     subprocess.run(cmd)
@@ -221,19 +243,29 @@ Examples:
                                help='Output CSV path')
     prepare_parser.add_argument('--audio-dir', '-a', type=str, default=None,
                                help='Audio directory (validates files exist)')
-    prepare_parser.add_argument('--valid-ratio', '-v', type=float, default=0.2,
-                               help='Validation ratio (default: 0.2)')
+    prepare_parser.add_argument('--valid-ratio', '-v', type=float, default=0.1,
+                               help='Validation ratio (default: 0.1)')
     prepare_parser.add_argument('--seed', type=int, default=42,
                                help='Random seed')
     prepare_parser.add_argument('--stratify', action='store_true',
                                help='Stratify by sentence length')
+    # Data limiting options
+    prepare_parser.add_argument('--limit', '-l', type=int, default=None,
+                               help='Max samples (e.g., 1000, 10000)')
+    prepare_parser.add_argument('--percentage', '-p', type=float, default=None,
+                               help='Percentage of data (e.g., 1, 5, 10)')
     
     # Preprocess command
     preprocess_parser = subparsers.add_parser('preprocess', help='Preprocess audio dataset')
     preprocess_parser.add_argument('--audio-dir', type=str, help='Audio directory')
     preprocess_parser.add_argument('--csv', type=str, help='CSV manifest path')
     preprocess_parser.add_argument('--output', type=str, help='Output directory')
-    preprocess_parser.add_argument('--workers', type=int, default=4, help='Number of workers')
+    preprocess_parser.add_argument('--workers', type=int, default=None, 
+                                   help='Number of parallel workers (default: auto)')
+    preprocess_parser.add_argument('--no-gpu', action='store_true',
+                                   help='Disable GPU acceleration')
+    preprocess_parser.add_argument('--single-thread', action='store_true',
+                                   help='Use single thread with GPU (best for small datasets)')
     
     # Train command
     train_parser = subparsers.add_parser('train', help='Train the model')

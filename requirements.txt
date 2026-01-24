@@ -1,6 +1,8 @@
 # Bangla ASR Pipeline Dependencies
 # wav2vec-BERT 2.0 with CTC
 
+python==3.12.3
+
 # Core ML frameworks
 torch>=2.0.0
 torchaudio>=2.0.0
@@ -13,7 +15,7 @@ soundfile>=0.12.0
 pyloudnorm>=0.1.0
 pydub>=0.25.0
 resampy>=0.4.0  # Required by librosa for resampling
-webrtcvad-wheels  # Pre-built VAD for Windows (no C++ compiler needed)
+webrtcvad
 
 # Data handling
 numpy>=1.24.0
