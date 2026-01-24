@@ -106,6 +106,12 @@ def train_command(args):
     if args.resume:
         cmd.extend(['--resume', args.resume])
     
+    if args.model:
+        cmd.extend(['--model', args.model])
+    
+    if args.use_pretrained_vocab:
+        cmd.append('--use-pretrained-vocab')
+    
     if args.wandb:
         cmd.append('--wandb')
         if args.wandb_project:
@@ -272,6 +278,11 @@ Examples:
     train_parser.add_argument('--manifest', type=str, required=True, help='Processed manifest CSV')
     train_parser.add_argument('--output-dir', type=str, default='./output', help='Output directory')
     train_parser.add_argument('--resume', type=str, help='Checkpoint to resume from')
+    train_parser.add_argument('--model', type=str, default=None,
+                             choices=['base', 'bangla', None],
+                             help='Model to use: "base" (facebook/w2v-bert-2.0) or "bangla" (sazzadul/Shrutimala_Bangla_ASR)')
+    train_parser.add_argument('--use-pretrained-vocab', action='store_true',
+                             help='Use vocabulary from pretrained model (recommended for Bangla models)')
     train_parser.add_argument('--wandb', action='store_true', help='Use W&B logging')
     train_parser.add_argument('--wandb-project', type=str, default='bangla-asr', help='W&B project')
     

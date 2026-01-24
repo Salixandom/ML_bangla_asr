@@ -36,34 +36,92 @@ from dataset import (
 )
 
 
+class PretrainedVocabularyWrapper:
+    """
+    Wrapper around a pretrained Wav2Vec2BertProcessor's tokenizer.
+    
+    Provides the same interface as BanglaVocabulary but uses the
+    pretrained model's vocabulary, preserving CTC head compatibility.
+    """
+    
+    def __init__(self, processor):
+        self.processor = processor
+        self.tokenizer = processor.tokenizer
+        
+        # Get special token IDs
+        self.pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+        self.unk_token_id = self.tokenizer.unk_token_id if self.tokenizer.unk_token_id is not None else 1
+        self.blank_token_id = self.pad_token_id  # CTC blank is usually pad
+        self.word_delimiter_id = self.tokenizer.word_delimiter_token_id if hasattr(self.tokenizer, 'word_delimiter_token_id') else self.pad_token_id
+        
+        # Build vocab mappings
+        self.vocab = self.tokenizer.get_vocab()
+        self.idx_to_char = {v: k for k, v in self.vocab.items()}
+    
+    def __len__(self):
+        return len(self.vocab)
+    
+    def encode(self, text: str) -> list:
+        """Encode text to token IDs using the pretrained tokenizer."""
+        # Use the processor's tokenizer
+        encoded = self.tokenizer(text, return_tensors=None)
+        return encoded['input_ids']
+    
+    def decode(self, token_ids: list, skip_special: bool = True) -> str:
+        """Decode token IDs back to text."""
+        # Filter out special tokens if requested
+        if skip_special:
+            special_ids = {self.pad_token_id, self.blank_token_id}
+            token_ids = [t for t in token_ids if t not in special_ids]
+        
+        # Use the tokenizer's decode
+        return self.tokenizer.decode(token_ids)
+    
+    def get_vocab_dict(self) -> dict:
+        """Return vocabulary dictionary."""
+        return self.vocab.copy()
+
+
 class Wav2VecBertCTCModel(nn.Module):
     """
     wav2vec-BERT 2.0 model wrapper for CTC-based ASR.
     
-    CRITICAL: This model takes RAW WAVEFORM as input.
-    The convolutional frontend learns features internally.
-    Do NOT pass spectrograms or MFCCs.
+    Supports:
+    - Loading pretrained Bangla model with its vocabulary
+    - Or custom vocabulary (reinitializes CTC head)
     """
     
     def __init__(
         self,
         config: PipelineConfig,
-        vocab_size: int,
-        pretrained_name: str = "facebook/w2v-bert-2.0"
+        vocab_size: int = None,
+        pretrained_name: str = "facebook/w2v-bert-2.0",
+        use_pretrained_vocab: bool = False
     ):
         super().__init__()
         
         self.config = config
+        self.use_pretrained_vocab = use_pretrained_vocab
         
-        # Load pretrained model
-        self.model = Wav2Vec2BertForCTC.from_pretrained(
-            pretrained_name,
-            vocab_size=vocab_size,
-            ctc_loss_reduction="mean",
-            ctc_zero_infinity=config.model.ctc_zero_infinity,
-            pad_token_id=0,  # vocabulary pad token
-            ignore_mismatched_sizes=True  # Allow vocab size change
-        )
+        if use_pretrained_vocab:
+            # Load model with its original vocabulary (no CTC head reinitialization)
+            self.model = Wav2Vec2BertForCTC.from_pretrained(
+                pretrained_name,
+                ctc_loss_reduction="mean",
+                ctc_zero_infinity=config.model.ctc_zero_infinity,
+            )
+            print(f"Loaded pretrained model with original vocabulary")
+        else:
+            # Load model with custom vocabulary (reinitializes CTC head)
+            self.model = Wav2Vec2BertForCTC.from_pretrained(
+                pretrained_name,
+                vocab_size=vocab_size,
+                ctc_loss_reduction="mean",
+                ctc_zero_infinity=config.model.ctc_zero_infinity,
+                pad_token_id=0,
+                ignore_mismatched_sizes=True
+            )
+            print(f"Loaded model with custom vocabulary (size={vocab_size})")
         
         # Print model structure for debugging
         print(f"Model structure: {[name for name, _ in self.model.wav2vec2_bert.named_children()]}")
@@ -120,8 +178,8 @@ class Wav2VecBertCTCModel(nn.Module):
         Forward pass for wav2vec-BERT 2.0.
         
         Args:
-            input_features: Extracted features (batch, seq_len, feature_dim)
-                           NOT raw waveform! Use SeamlessM4TFeatureExtractor.
+            input_features: Extracted features (batch, seq_len, 160)
+                           Use SeamlessM4TFeatureExtractor to extract.
             attention_mask: Mask for padded positions
             labels: Token IDs for CTC loss (-100 for padding)
             
@@ -173,11 +231,14 @@ class CTCDecoder:
     Supports:
     - Greedy decoding
     - Beam search (optional)
+    
+    NOTE: Hugging Face CTC uses pad_token_id as the blank token.
     """
     
-    def __init__(self, vocabulary: BanglaVocabulary, blank_id: int = 2):
+    def __init__(self, vocabulary: BanglaVocabulary, blank_id: int = None):
         self.vocabulary = vocabulary
-        self.blank_id = blank_id
+        # Use vocabulary's pad_token_id as CTC blank (Hugging Face convention)
+        self.blank_id = blank_id if blank_id is not None else vocabulary.pad_token_id
     
     def decode_greedy(self, logits: torch.Tensor) -> list:
         """
@@ -369,9 +430,8 @@ class Trainer:
         pbar = tqdm(self.train_loader, desc=f"Epoch {epoch}")
         
         for batch_idx, batch in enumerate(pbar):
-            # Move to device
-            # NOTE: Collator outputs 'input_values' key for both raw waveform and features
-            input_features = batch['input_values'].to(self.device)
+            # Move to device - pre-extracted features
+            input_features = batch['input_features'].to(self.device)
             attention_mask = batch['attention_mask'].to(self.device)
             labels = batch['labels'].to(self.device)
             
@@ -461,7 +521,7 @@ class Trainer:
         num_batches = 0
         
         for batch in tqdm(self.valid_loader, desc="Evaluating"):
-            input_features = batch['input_values'].to(self.device)
+            input_features = batch['input_features'].to(self.device)
             attention_mask = batch['attention_mask'].to(self.device)
             labels = batch['labels'].to(self.device)
             
@@ -620,6 +680,7 @@ class Trainer:
 def main():
     """Main training entry point."""
     import argparse
+    from transformers import Wav2Vec2BertProcessor
     
     parser = argparse.ArgumentParser(description='Train Bangla ASR model')
     parser.add_argument('--manifest', type=str, required=True,
@@ -628,22 +689,66 @@ def main():
                        help='Output directory for checkpoints')
     parser.add_argument('--resume', type=str, default=None,
                        help='Path to checkpoint to resume from')
+    parser.add_argument('--model', type=str, default=None,
+                       choices=['base', 'bangla'],
+                       help='Model: "base" (facebook/w2v-bert-2.0) or "bangla" (sazzadul/Shrutimala_Bangla_ASR)')
+    parser.add_argument('--use-pretrained-vocab', action='store_true',
+                       help='Use vocabulary from pretrained model (recommended for Bangla models)')
     parser.add_argument('--wandb', action='store_true',
                        help='Use Weights & Biases logging')
     parser.add_argument('--wandb-project', type=str, default='bangla-asr',
                        help='W&B project name')
     args = parser.parse_args()
     
+    # Model configurations
+    MODEL_CONFIGS = {
+        'base': {
+            'name': 'facebook/w2v-bert-2.0',
+            'learning_rate': 3e-5,
+            'freeze_feature_encoder': True,
+            'warmup_steps': 1000,
+        },
+        'bangla': {
+            'name': 'sazzadul/Shrutimala_Bangla_ASR',
+            'learning_rate': 1e-5,
+            'freeze_feature_encoder': False,
+            'warmup_steps': 500,
+        }
+    }
+    
     # Load config
     config = get_config()
+    
+    # Override config based on model selection
+    if args.model:
+        model_cfg = MODEL_CONFIGS[args.model]
+        config.model.model_name = model_cfg['name']
+        config.model.learning_rate = model_cfg['learning_rate']
+        config.model.freeze_feature_encoder = model_cfg['freeze_feature_encoder']
+        config.model.warmup_steps = model_cfg['warmup_steps']
+        print(f"\n{'='*60}")
+        print(f"Model: {args.model.upper()}")
+        print(f"  Name: {config.model.model_name}")
+        print(f"  Learning rate: {config.model.learning_rate}")
+        print(f"  Freeze encoder: {config.model.freeze_feature_encoder}")
+        print(f"{'='*60}\n")
     
     # Set random seed
     torch.manual_seed(config.seed)
     np.random.seed(config.seed)
     
     # Initialize vocabulary
-    vocab = BanglaVocabulary(config.tokenizer)
-    print(f"Vocabulary size: {len(vocab)}")
+    if args.use_pretrained_vocab:
+        # Load processor from pretrained model (includes tokenizer)
+        processor = Wav2Vec2BertProcessor.from_pretrained(config.model.model_name)
+        vocab = PretrainedVocabularyWrapper(processor)
+        print(f"Using pretrained vocabulary from {config.model.model_name}")
+        print(f"Vocabulary size: {len(vocab)}")
+    else:
+        # Use our own Bangla vocabulary
+        vocab = BanglaVocabulary(config.tokenizer)
+        print(f"Using custom Bangla vocabulary")
+        print(f"Vocabulary size: {len(vocab)}")
     
     # Create dataloaders
     dataloaders = create_dataloaders(
@@ -656,7 +761,8 @@ def main():
     model = Wav2VecBertCTCModel(
         config=config,
         vocab_size=len(vocab),
-        pretrained_name=config.model.model_name
+        pretrained_name=config.model.model_name,
+        use_pretrained_vocab=args.use_pretrained_vocab
     )
     
     # Initialize wandb
@@ -668,6 +774,7 @@ def main():
                 'learning_rate': config.model.learning_rate,
                 'batch_size': config.model.per_device_train_batch_size,
                 'epochs': config.model.num_train_epochs,
+                'use_pretrained_vocab': args.use_pretrained_vocab,
             }
         )
     

@@ -58,16 +58,19 @@ class AugmentationConfig:
 @dataclass
 class ModelConfig:
     """Model configuration"""
+    # Default to base model - use --model flag to select
     model_name: str = "facebook/w2v-bert-2.0"
-    # Alternative: "facebook/wav2vec2-xls-r-300m" for multilingual
+    # Alternatives:
+    #   "facebook/w2v-bert-2.0" - base multilingual model
+    #   "sazzadul/Shrutimala_Bangla_ASR" - Bangla pretrained model
     
     # CTC settings
     ctc_blank_token: str = "<blank>"
     ctc_zero_infinity: bool = True
     
-    # Training hyperparameters
-    learning_rate: float = 1e-4
-    warmup_steps: int = 500
+    # Training hyperparameters (adjusted by --model flag)
+    learning_rate: float = 3e-5
+    warmup_steps: int = 1000
     weight_decay: float = 0.01
     max_grad_norm: float = 1.0
     
@@ -77,7 +80,7 @@ class ModelConfig:
     gradient_accumulation_steps: int = 4
     
     # Training epochs
-    num_train_epochs: int = 5
+    num_train_epochs: int = 30
     eval_steps: int = 500
     save_steps: int = 1000
     logging_steps: int = 100
@@ -85,7 +88,7 @@ class ModelConfig:
     # Mixed precision
     fp16: bool = True
     
-    # Freeze feature encoder for initial training
+    # Freeze feature encoder (adjusted by --model flag)
     freeze_feature_encoder: bool = True
     freeze_feature_encoder_steps: int = 10000
 

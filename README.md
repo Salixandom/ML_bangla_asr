@@ -88,6 +88,19 @@ python run.py train --manifest ./processed/manifest.csv
 python run.py submit --checkpoint ./output/best --test-dir ./data/test
 ```
 
+### Model Run options
+
+```bash
+# Base Model (facebook/w2v-bert-2.0)
+python run.py train --model base --manifest ./processed/manifest.csv --output-dir ./output
+
+# Bangla Pretrained Model (sazzadul/Shrutimala_Bangla_ASR)
+python run.py train --model bangla --manifest ./processed/manifest.csv --output-dir ./output
+
+# Bangla Pretrained Model with Pretrained Vocabulary (sazzadul/Shrutimala_Bangla_ASR)
+python run.py train --model bangla --use-pretrained-vocab --manifest ./processed/manifest.csv --output-dir ./output
+```
+
 ## Detailed Usage
 
 ### 1. Prepare Dataset
