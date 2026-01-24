@@ -15,7 +15,7 @@ import torch
 import torch.nn as nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import OneCycleLR
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 from tqdm import tqdm
@@ -26,17 +26,12 @@ import json
 
 from transformers import (
     Wav2Vec2BertForCTC,
-    Wav2Vec2BertConfig,
-    Wav2Vec2BertProcessor,
-    AutoFeatureExtractor,
     get_scheduler
 )
 
 from config import PipelineConfig, get_config
 from dataset import (
     BanglaVocabulary, 
-    BanglaASRDataset, 
-    DataCollatorCTCWithPadding,
     create_dataloaders
 )
 
@@ -70,34 +65,63 @@ class Wav2VecBertCTCModel(nn.Module):
             ignore_mismatched_sizes=True  # Allow vocab size change
         )
         
+        # Print model structure for debugging
+        print(f"Model structure: {[name for name, _ in self.model.wav2vec2_bert.named_children()]}")
+        
         # Optionally freeze feature encoder
         if config.model.freeze_feature_encoder:
             self._freeze_feature_encoder()
     
     def _freeze_feature_encoder(self):
-        """Freeze the convolutional feature encoder."""
-        for param in self.model.wav2vec2_bert.feature_extractor.parameters():
-            param.requires_grad = False
-        print("Feature encoder frozen")
+        """
+        Freeze the feature encoder layers.
+        
+        wav2vec-BERT 2.0 has a different architecture than wav2vec2.
+        We freeze the feature_projection and optionally early encoder layers.
+        """
+        # Freeze feature projection
+        if hasattr(self.model.wav2vec2_bert, 'feature_projection'):
+            for param in self.model.wav2vec2_bert.feature_projection.parameters():
+                param.requires_grad = False
+            print("Feature projection frozen")
+        
+        # Freeze adapter if it exists and is not None
+        adapter = getattr(self.model.wav2vec2_bert, 'adapter', None)
+        if adapter is not None:
+            for param in adapter.parameters():
+                param.requires_grad = False
+            print("Adapter frozen")
+        
+        # Optionally freeze early encoder layers (first half)
+        if hasattr(self.model.wav2vec2_bert, 'encoder'):
+            encoder = self.model.wav2vec2_bert.encoder
+            if hasattr(encoder, 'layers'):
+                num_layers = len(encoder.layers)
+                freeze_layers = num_layers // 2  # Freeze first half
+                for i, layer in enumerate(encoder.layers[:freeze_layers]):
+                    for param in layer.parameters():
+                        param.requires_grad = False
+                print(f"Frozen first {freeze_layers}/{num_layers} encoder layers")
     
     def _unfreeze_feature_encoder(self):
-        """Unfreeze the convolutional feature encoder."""
-        for param in self.model.wav2vec2_bert.feature_extractor.parameters():
+        """Unfreeze all encoder parameters."""
+        for param in self.model.wav2vec2_bert.parameters():
             param.requires_grad = True
-        print("Feature encoder unfrozen")
+        print("All encoder layers unfrozen")
     
     def forward(
         self,
-        input_values: torch.Tensor,
+        input_features: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
         **kwargs
     ) -> Dict[str, torch.Tensor]:
         """
-        Forward pass.
+        Forward pass for wav2vec-BERT 2.0.
         
         Args:
-            input_values: Raw waveform (batch, time)
+            input_features: Extracted features (batch, seq_len, feature_dim)
+                           NOT raw waveform! Use SeamlessM4TFeatureExtractor.
             attention_mask: Mask for padded positions
             labels: Token IDs for CTC loss (-100 for padding)
             
@@ -105,7 +129,7 @@ class Wav2VecBertCTCModel(nn.Module):
             Dictionary with loss, logits
         """
         outputs = self.model(
-            input_values=input_values,
+            input_features=input_features,
             attention_mask=attention_mask,
             labels=labels
         )
@@ -323,7 +347,7 @@ class Trainer:
         )
         
         # Setup mixed precision
-        self.scaler = GradScaler() if config.model.fp16 else None
+        self.scaler = GradScaler('cuda') if config.model.fp16 else None
         
         # Setup decoder
         self.decoder = CTCDecoder(vocabulary)
@@ -346,15 +370,16 @@ class Trainer:
         
         for batch_idx, batch in enumerate(pbar):
             # Move to device
-            input_values = batch['input_values'].to(self.device)
+            # NOTE: Collator outputs 'input_values' key for both raw waveform and features
+            input_features = batch['input_values'].to(self.device)
             attention_mask = batch['attention_mask'].to(self.device)
             labels = batch['labels'].to(self.device)
             
             # Forward pass with mixed precision
             if self.config.model.fp16:
-                with autocast():
+                with autocast('cuda'):
                     outputs = self.model(
-                        input_values=input_values,
+                        input_features=input_features,
                         attention_mask=attention_mask,
                         labels=labels
                     )
@@ -363,7 +388,7 @@ class Trainer:
                 self.scaler.scale(loss).backward()
             else:
                 outputs = self.model(
-                    input_values=input_values,
+                    input_features=input_features,
                     attention_mask=attention_mask,
                     labels=labels
                 )
@@ -386,12 +411,19 @@ class Trainer:
                 
                 # Optimizer step
                 if self.config.model.fp16:
+                    # Check if optimizer step was skipped due to inf/nan gradients
+                    old_scale = self.scaler.get_scale()
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
+                    new_scale = self.scaler.get_scale()
+                    
+                    # Only step scheduler if optimizer actually stepped
+                    if old_scale <= new_scale:
+                        self.scheduler.step()
                 else:
                     self.optimizer.step()
+                    self.scheduler.step()
                 
-                self.scheduler.step()
                 self.optimizer.zero_grad()
                 
                 self.global_step += 1
@@ -415,28 +447,6 @@ class Trainer:
                         'train/lr': self.scheduler.get_last_lr()[0],
                         'train/step': self.global_step
                     })
-            
-            # Evaluation
-            if self.global_step % self.config.model.eval_steps == 0:
-                eval_metrics = self.evaluate()
-                self.model.train()
-                
-                if self.use_wandb:
-                    wandb.log({
-                        'eval/wer': eval_metrics['wer'],
-                        'eval/cer': eval_metrics['cer'],
-                        'eval/loss': eval_metrics['loss'],
-                        'eval/step': self.global_step
-                    })
-                
-                # Save best model
-                if eval_metrics['wer'] < self.best_wer:
-                    self.best_wer = eval_metrics['wer']
-                    self.save_checkpoint('best')
-            
-            # Save checkpoint
-            if self.global_step % self.config.model.save_steps == 0:
-                self.save_checkpoint(f'step_{self.global_step}')
         
         return {'loss': total_loss / num_batches}
     
@@ -451,12 +461,12 @@ class Trainer:
         num_batches = 0
         
         for batch in tqdm(self.valid_loader, desc="Evaluating"):
-            input_values = batch['input_values'].to(self.device)
+            input_features = batch['input_values'].to(self.device)
             attention_mask = batch['attention_mask'].to(self.device)
             labels = batch['labels'].to(self.device)
             
             outputs = self.model(
-                input_values=input_values,
+                input_features=input_features,
                 attention_mask=attention_mask,
                 labels=labels
             )
@@ -486,12 +496,15 @@ class Trainer:
         
         print(f"\nEvaluation: Loss={metrics['loss']:.4f}, WER={wer:.4f}, CER={cer:.4f}")
         
-        # Print some examples
-        print("\nSample predictions:")
-        for i in range(min(3, len(all_predictions))):
-            print(f"  Ref: {all_references[i]}")
-            print(f"  Pred: {all_predictions[i]}")
-            print()
+        # Save sample predictions to file (avoids terminal font issues)
+        samples_file = self.output_dir / 'sample_predictions.txt'
+        with open(samples_file, 'w', encoding='utf-8') as f:
+            f.write(f"Step: {self.global_step}\n")
+            f.write(f"WER: {wer:.4f}, CER: {cer:.4f}\n\n")
+            for i in range(min(10, len(all_predictions))):
+                f.write(f"[{i+1}] Ref:  {all_references[i]}\n")
+                f.write(f"    Pred: {all_predictions[i]}\n\n")
+        print(f"Sample predictions saved to {samples_file}")
         
         return metrics
     

@@ -196,10 +196,20 @@ class AudioPreprocessor:
     def _load_audio(self, audio_path: Path) -> Tuple[np.ndarray, int]:
         """
         Step 1: Decode audio file to mono float32 waveform.
-        Uses torchaudio for speed, falls back to librosa for problematic files.
+        Uses torchaudio for WAV/FLAC, librosa for MP3 (more reliable).
         """
+        suffix = audio_path.suffix.lower()
+        
+        # Use librosa for MP3 (torchaudio has FFmpeg issues on some systems)
+        if suffix == '.mp3':
+            if HAS_LIBROSA:
+                waveform, sr = librosa.load(audio_path, sr=None, mono=True)
+                return waveform.astype(np.float32), sr
+            else:
+                raise RuntimeError(f"librosa required for MP3 files: {audio_path}")
+        
+        # Try torchaudio for WAV/FLAC (faster)
         try:
-            # Try torchaudio first (faster)
             waveform, sr = torchaudio.load(audio_path)
             
             # Convert to mono
@@ -212,7 +222,6 @@ class AudioPreprocessor:
         except Exception as e:
             # Fallback to librosa
             if HAS_LIBROSA:
-                warnings.warn(f"torchaudio failed for {audio_path}, using librosa: {e}")
                 waveform, sr = librosa.load(audio_path, sr=None, mono=True)
                 return waveform.astype(np.float32), sr
             else:

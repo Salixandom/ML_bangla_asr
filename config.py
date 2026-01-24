@@ -77,7 +77,7 @@ class ModelConfig:
     gradient_accumulation_steps: int = 4
     
     # Training epochs
-    num_train_epochs: int = 30
+    num_train_epochs: int = 5
     eval_steps: int = 500
     save_steps: int = 1000
     logging_steps: int = 100

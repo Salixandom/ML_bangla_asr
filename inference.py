@@ -17,15 +17,26 @@ import soundfile as sf
 from tqdm import tqdm
 import pandas as pd
 
-from transformers import (
-    Wav2Vec2BertForCTC,
-    Wav2Vec2BertProcessor,
-)
+from transformers import SeamlessM4TFeatureExtractor
 
 from config import PipelineConfig, InferenceConfig, get_config
 from preprocessing import AudioPreprocessor
 from dataset import BanglaVocabulary
 from train import Wav2VecBertCTCModel, CTCDecoder
+
+
+# Global feature extractor (cached)
+_FEATURE_EXTRACTOR = None
+
+def get_feature_extractor(sample_rate: int = 16000) -> SeamlessM4TFeatureExtractor:
+    """Get or create the feature extractor for wav2vec-BERT 2.0."""
+    global _FEATURE_EXTRACTOR
+    if _FEATURE_EXTRACTOR is None:
+        _FEATURE_EXTRACTOR = SeamlessM4TFeatureExtractor.from_pretrained(
+            "facebook/w2v-bert-2.0",
+            sampling_rate=sample_rate
+        )
+    return _FEATURE_EXTRACTOR
 
 
 class BanglaBERTPostProcessor:
@@ -357,16 +368,24 @@ class ASRInference:
         # Preprocess audio
         processed = self.preprocessor.process_file(audio_path)
         
+        # Get feature extractor
+        feature_extractor = get_feature_extractor(processed.sample_rate)
+        
         all_transcriptions = []
         chunk_results = []
         
         for chunk_audio, start_time, end_time in processed.chunks:
-            # Prepare input
-            input_values = torch.from_numpy(chunk_audio).float().unsqueeze(0)
-            input_values = input_values.to(self.device)
+            # Extract features for wav2vec-BERT 2.0
+            features = feature_extractor(
+                chunk_audio,
+                sampling_rate=processed.sample_rate,
+                return_tensors="pt",
+                padding=False
+            )
+            input_features = features.input_features.to(self.device)
             
             # Forward pass
-            outputs = self.model(input_values=input_values)
+            outputs = self.model(input_features=input_features)
             logits = outputs['logits']
             
             # Decode
