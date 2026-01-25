@@ -4,8 +4,29 @@ Model: wav2vec-BERT 2.0 (CTC)
 """
 
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from pathlib import Path
+
+
+# =============================================================================
+# MODEL PRESETS - Use with --model flag
+# =============================================================================
+MODEL_PRESETS: Dict[str, Dict[str, Any]] = {
+    'base': {
+        'name': 'facebook/w2v-bert-2.0',
+        'description': 'Base multilingual wav2vec-BERT 2.0',
+        'learning_rate_frozen': 3e-5,
+        'learning_rate_unfrozen': 5e-6,
+        'warmup_steps': 1000,
+    },
+    'bangla': {
+        'name': 'sazzadul/Shrutimala_Bangla_ASR',
+        'description': 'Bangla-finetuned wav2vec-BERT 2.0 (recommended)',
+        'learning_rate_frozen': 1e-5,
+        'learning_rate_unfrozen': 3e-6,
+        'warmup_steps': 500,
+    }
+}
 
 
 @dataclass
@@ -90,7 +111,7 @@ class ModelConfig:
     
     # Freeze feature encoder (adjusted by --model flag)
     freeze_feature_encoder: bool = True
-    freeze_feature_encoder_steps: int = 10000
+    freeze_feature_encoder_steps: int = 0  # 0 = never unfreeze automatically
 
 
 @dataclass

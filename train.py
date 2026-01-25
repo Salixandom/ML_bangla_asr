@@ -29,7 +29,7 @@ from transformers import (
     get_scheduler
 )
 
-from config import PipelineConfig, get_config
+from config import PipelineConfig, get_config, MODEL_PRESETS
 from dataset import (
     BanglaVocabulary, 
     create_dataloaders
@@ -416,6 +416,7 @@ class Trainer:
         # Training state
         self.global_step = 0
         self.best_wer = float('inf')
+        self.start_epoch = 1  # Will be updated if resuming from checkpoint
         
         # Gradient accumulation
         self.gradient_accumulation_steps = config.model.gradient_accumulation_steps
@@ -488,8 +489,9 @@ class Trainer:
                 
                 self.global_step += 1
                 
-                # Unfreeze feature encoder after warmup
+                # Unfreeze feature encoder after warmup (0 = never unfreeze)
                 if (self.config.model.freeze_feature_encoder and 
+                    self.config.model.freeze_feature_encoder_steps > 0 and
                     self.global_step == self.config.model.freeze_feature_encoder_steps):
                     self.model._unfreeze_feature_encoder()
             
@@ -568,13 +570,14 @@ class Trainer:
         
         return metrics
     
-    def save_checkpoint(self, name: str, keep_latest: int = None):
+    def save_checkpoint(self, name: str, keep_latest: int = None, epoch: int = None):
         """
         Save training checkpoint.
         
         Args:
             name: Checkpoint name (e.g., 'best', 'epoch_1', 'step_1000')
             keep_latest: If set, keep only the latest N epoch checkpoints
+            epoch: Current epoch number to save
         """
         checkpoint_dir = self.output_dir / name
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -582,19 +585,25 @@ class Trainer:
         # Save model
         self.model.save_pretrained(checkpoint_dir)
         
-        # Save training state
+        # Save training state (including epoch and scaler!)
         state = {
             'global_step': self.global_step,
             'best_wer': self.best_wer,
+            'epoch': epoch if epoch is not None else 0,
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
         }
+        
+        # Save scaler state for mixed precision
+        if self.scaler is not None:
+            state['scaler_state_dict'] = self.scaler.state_dict()
+        
         torch.save(state, checkpoint_dir / 'training_state.pt')
         
         # Save vocabulary
         self.vocabulary.save(checkpoint_dir / 'vocabulary.json')
         
-        print(f"Checkpoint saved to {checkpoint_dir}")
+        print(f"Model saved to {checkpoint_dir}")
         
         # Clean up old epoch checkpoints (keep only latest N)
         if keep_latest is not None and name.startswith('epoch_'):
@@ -626,25 +635,60 @@ class Trainer:
             shutil.rmtree(checkpoint_dir)
     
     def load_checkpoint(self, checkpoint_dir: Path):
-        """Load training checkpoint."""
+        """Load training checkpoint including model weights."""
         checkpoint_dir = Path(checkpoint_dir)
         
+        # Load model weights from checkpoint
+        print(f"Loading model weights from {checkpoint_dir}...")
+        self.model.model = Wav2Vec2BertForCTC.from_pretrained(checkpoint_dir)
+        self.model = self.model.to(self.device)
+        
+        # IMPORTANT: Recreate optimizer with NEW model parameters
+        # (The old optimizer was pointing to the old model's parameters)
+        self.optimizer = AdamW(
+            self.model.parameters(),
+            lr=self.config.model.learning_rate,
+            weight_decay=self.config.model.weight_decay
+        )
+        
         # Load training state
-        state = torch.load(checkpoint_dir / 'training_state.pt')
+        state = torch.load(checkpoint_dir / 'training_state.pt', map_location=self.device)
         self.global_step = state['global_step']
         self.best_wer = state['best_wer']
+        
+        # Load optimizer state
         self.optimizer.load_state_dict(state['optimizer_state_dict'])
+        
+        # Load scheduler state
         self.scheduler.load_state_dict(state['scheduler_state_dict'])
         
+        # Load scaler state if available (for mixed precision)
+        if 'scaler_state_dict' in state and self.scaler is not None:
+            self.scaler.load_state_dict(state['scaler_state_dict'])
+        
+        # Recover epoch (with fallback for old checkpoints without epoch field)
+        if 'epoch' in state and state['epoch'] > 0:
+            self.start_epoch = state['epoch'] + 1  # Resume from next epoch
+        else:
+            # Estimate epoch from global_step
+            steps_per_epoch = len(self.train_loader)
+            estimated_epoch = self.global_step // steps_per_epoch
+            self.start_epoch = max(estimated_epoch, 1)  # At least epoch 1
+            print(f"  (Epoch estimated from global_step {self.global_step}: ~{estimated_epoch})")
+        
         print(f"Checkpoint loaded from {checkpoint_dir}")
+        print(f"  Resuming from epoch {self.start_epoch}, step {self.global_step}, best WER: {self.best_wer:.4f}")
     
     def train(self):
         """Full training loop."""
-        print(f"Starting training for {self.config.model.num_train_epochs} epochs")
-        print(f"Total steps: {len(self.train_loader) * self.config.model.num_train_epochs}")
+        total_epochs = self.config.model.num_train_epochs
+        remaining_epochs = total_epochs - self.start_epoch + 1
+        
+        print(f"Starting training from epoch {self.start_epoch} to {total_epochs}")
+        print(f"Remaining epochs: {remaining_epochs}")
         print(f"Device: {self.device}")
         
-        for epoch in range(1, self.config.model.num_train_epochs + 1):
+        for epoch in range(self.start_epoch, total_epochs + 1):
             train_metrics = self.train_epoch(epoch)
             
             # End of epoch evaluation
@@ -668,11 +712,11 @@ class Trainer:
             # Save best model if WER improved
             if eval_metrics['wer'] < self.best_wer:
                 self.best_wer = eval_metrics['wer']
-                self.save_checkpoint('best')
+                self.save_checkpoint('best', epoch=epoch)
                 print(f"  ✅ New best model saved! WER: {self.best_wer:.4f}")
             
             # Save epoch checkpoint (keeps only latest 3)
-            self.save_checkpoint(f'epoch_{epoch}', keep_latest=3)
+            self.save_checkpoint(f'epoch_{epoch}', keep_latest=3, epoch=epoch)
         
         print(f"\nTraining complete! Best WER: {self.best_wer:.4f}")
 
@@ -689,9 +733,13 @@ def main():
                        help='Output directory for checkpoints')
     parser.add_argument('--resume', type=str, default=None,
                        help='Path to checkpoint to resume from')
-    parser.add_argument('--model', type=str, default=None,
+    parser.add_argument('--start-epoch', type=int, default=None,
+                       help='Override start epoch when resuming (for old checkpoints)')
+    parser.add_argument('--model', type=str, default='base',
                        choices=['base', 'bangla'],
                        help='Model: "base" (facebook/w2v-bert-2.0) or "bangla" (sazzadul/Shrutimala_Bangla_ASR)')
+    parser.add_argument('--unfreeze', action='store_true',
+                       help='Unfreeze all encoder layers (slower but potentially better). Default: frozen')
     parser.add_argument('--use-pretrained-vocab', action='store_true',
                        help='Use vocabulary from pretrained model (recommended for Bangla models)')
     parser.add_argument('--wandb', action='store_true',
@@ -700,38 +748,34 @@ def main():
                        help='W&B project name')
     args = parser.parse_args()
     
-    # Model configurations
-    MODEL_CONFIGS = {
-        'base': {
-            'name': 'facebook/w2v-bert-2.0',
-            'learning_rate': 3e-5,
-            'freeze_feature_encoder': True,
-            'warmup_steps': 1000,
-        },
-        'bangla': {
-            'name': 'sazzadul/Shrutimala_Bangla_ASR',
-            'learning_rate': 1e-5,
-            'freeze_feature_encoder': False,
-            'warmup_steps': 500,
-        }
-    }
-    
     # Load config
     config = get_config()
     
-    # Override config based on model selection
-    if args.model:
-        model_cfg = MODEL_CONFIGS[args.model]
-        config.model.model_name = model_cfg['name']
-        config.model.learning_rate = model_cfg['learning_rate']
-        config.model.freeze_feature_encoder = model_cfg['freeze_feature_encoder']
-        config.model.warmup_steps = model_cfg['warmup_steps']
-        print(f"\n{'='*60}")
-        print(f"Model: {args.model.upper()}")
-        print(f"  Name: {config.model.model_name}")
-        print(f"  Learning rate: {config.model.learning_rate}")
-        print(f"  Freeze encoder: {config.model.freeze_feature_encoder}")
-        print(f"{'='*60}\n")
+    # Override config based on model selection (uses MODEL_PRESETS from config.py)
+    model_cfg = MODEL_PRESETS[args.model]
+    config.model.model_name = model_cfg['name']
+    config.model.freeze_feature_encoder = not args.unfreeze
+    config.model.freeze_feature_encoder_steps = 0  # Never auto-unfreeze
+    config.model.warmup_steps = model_cfg['warmup_steps']
+    
+    # Set learning rate based on frozen/unfrozen
+    if args.unfreeze:
+        config.model.learning_rate = model_cfg['learning_rate_unfrozen']
+    else:
+        config.model.learning_rate = model_cfg['learning_rate_frozen']
+    
+    print(f"\n{'='*60}")
+    print(f"TRAINING CONFIGURATION")
+    print(f"{'='*60}")
+    print(f"Model: {args.model} ({config.model.model_name})")
+    print(f"Frozen: {config.model.freeze_feature_encoder} {'(fast)' if config.model.freeze_feature_encoder else '(slow - all layers trainable)'}")
+    print(f"Learning rate: {config.model.learning_rate}")
+    print(f"Warmup steps: {config.model.warmup_steps}")
+    if args.use_pretrained_vocab:
+        print(f"Vocabulary: Pretrained (from model)")
+    else:
+        print(f"Vocabulary: Custom Bangla (79 chars)")
+    print(f"{'='*60}\n")
     
     # Set random seed
     torch.manual_seed(config.seed)
@@ -792,6 +836,11 @@ def main():
     # Resume from checkpoint if specified
     if args.resume:
         trainer.load_checkpoint(args.resume)
+        
+        # Override start epoch if specified (for old checkpoints)
+        if args.start_epoch is not None:
+            trainer.start_epoch = args.start_epoch
+            print(f"  Start epoch overridden to: {args.start_epoch}")
     
     # Train
     trainer.train()
