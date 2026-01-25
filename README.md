@@ -104,13 +104,17 @@ All model presets are defined in `config.py` under `MODEL_PRESETS`.
 # Clone or copy the project
 cd bangla_asr
 
+# install uv
+curl -LsSf https://astral.sh/uv/install.sh | sh  # Linux/Mac
+# or: powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"  # Windows
+
 # Create virtual environment
-python -m venv venv
+uv venv venv
 source venv/bin/activate  # Linux/Mac
 # or: venv\Scripts\activate  # Windows
 
 # Install dependencies
-pip install -r requirements.txt
+uv pip install -r requirements.txt
 
 # Optional: Install FFmpeg for faster audio loading
 sudo apt install ffmpeg  # Linux/WSL
@@ -120,6 +124,9 @@ sudo apt install ffmpeg  # Linux/WSL
 
 ```
 bangla_asr/
+├── data                # Raw data
+├── output              # Training weights & checkpoints
+├── processed           # Preprocessed data
 ├── config.py           # All configurations & MODEL_PRESETS
 ├── prepare_data.py     # Dataset preparation & splitting
 ├── preprocessing.py    # Audio preprocessing & VAD
