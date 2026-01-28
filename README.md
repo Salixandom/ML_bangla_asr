@@ -7,6 +7,7 @@ End-to-end Automatic Speech Recognition system for Bangla using **wav2vec-BERT 2
 - **Model Selection**: Choose between base multilingual or Bangla-pretrained models
 - **Flexible Training**: Frozen (fast) or unfrozen (full) encoder training
 - **Vocabulary Options**: Custom character vocab or pretrained model vocab
+- **YouTube Processor**: Download songs, fetch lyrics, create training data automatically
 - **wav2vec-BERT 2.0**: State-of-the-art self-supervised speech model
 - **CTC Loss**: Connectionist Temporal Classification for sequence-to-sequence
 - **Robust Preprocessing**: VAD, chunking, loudness normalization with GPU acceleration
@@ -30,6 +31,127 @@ python run.py train --model base --manifest ./processed/manifest.csv     # Alter
 # Step 4: Generate submission
 python run.py submit --checkpoint ./output/best --test-dir ./data/test
 ```
+
+## Installation
+
+```bash
+# Clone or copy the project
+cd bangla_asr
+
+# Create virtual environment
+python -m venv venv
+source venv/bin/activate  # Linux/Mac
+# or: venv\Scripts\activate  # Windows
+
+# Install dependencies
+pip install -r requirements.txt
+
+# REQUIRED: Install FFmpeg (for audio processing)
+sudo apt update && sudo apt install ffmpeg  # Ubuntu/Debian
+# or: brew install ffmpeg                   # macOS
+# or: choco install ffmpeg                  # Windows
+
+# RECOMMENDED: Install webrtcvad for better voice detection
+pip install webrtcvad  # Linux/Mac
+pip install webrtcvad-wheels  # Windows
+```
+
+## Project Structure
+
+```
+bangla_asr/
+├── config.py           # All configurations & MODEL_PRESETS
+├── prepare_data.py     # Dataset preparation & splitting
+├── preprocessing.py    # Audio preprocessing & VAD
+├── augmentation.py     # Training augmentations
+├── dataset.py          # Dataset & vocabulary classes
+├── train.py            # Training script
+├── inference.py        # Inference & submission
+├── youtube_processor.py # YouTube audio + lyrics processor
+├── run.py              # CLI wrapper
+├── requirements.txt    # Dependencies
+└── README.md           # This file
+```
+
+---
+
+## YouTube Processor
+
+Download audio from YouTube, fetch synced lyrics, and create training data automatically.
+
+### Features
+
+| Feature | Description |
+|---------|-------------|
+| **Audio Download** | Downloads audio using yt-dlp |
+| **Lyrics Fetching** | LRCLib (synced, free) or Genius API (plain) |
+| **Smart Chunking** | 10-15 second segments |
+| **Speech Detection** | Keeps speech+music, removes instrumental-only |
+| **Lyrics Alignment** | Aligns lyrics to chunks by timestamp |
+
+### Usage
+
+```bash
+# Basic usage (LRCLib for synced lyrics - free, no API key!)
+python run.py youtube --url "https://youtube.com/watch?v=VIDEO_ID" --output ./song_data
+
+# With Genius API fallback (get token from genius.com/api-clients)
+python run.py youtube --url "..." --genius-token YOUR_TOKEN --output ./song_data
+
+# Adjust speech detection
+python run.py youtube --url "..." --min-speech-ratio 0.15  # Keep more noisy chunks
+python run.py youtube --url "..." --min-speech-ratio 0.4   # Stricter filtering
+```
+
+### How It Works
+
+```
+YouTube Video
+ → Download audio (yt-dlp)
+ → Fetch synced lyrics (LRCLib) or plain lyrics (Genius)
+ → Split into 10-15 second chunks
+ → Voice Activity Detection on each chunk
+ → KEEP chunks with speech (even with background music)
+ → REMOVE chunks with only music/instrumentals
+ → Align lyrics to chunks by timestamp
+ → Output manifest.csv with transcripts
+```
+
+### Output Structure
+
+```
+youtube_data/
+├── audio/                    # Original downloaded audio
+│   └── Song_Title.wav
+├── chunks/                   # Speech chunks (10-15s each)
+│   ├── Song_Title_chunk_0000.wav
+│   ├── Song_Title_chunk_0001.wav
+│   └── ...
+├── manifest.csv              # Training manifest with lyrics
+├── lyrics.json               # Full synced + plain lyrics
+└── metadata.json             # Video info
+```
+
+### Train with YouTube Data
+
+```bash
+# After processing YouTube video
+python run.py train --model bangla --manifest ./youtube_data/manifest.csv
+```
+
+### YouTube Command Options
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--url`, `-u` | YouTube video URL | Required |
+| `--output`, `-o` | Output directory | ./youtube_data |
+| `--genius-token` | Genius API token (optional) | None |
+| `--min-chunk` | Min chunk duration (seconds) | 10.0 |
+| `--max-chunk` | Max chunk duration (seconds) | 15.0 |
+| `--min-speech-ratio` | Min speech ratio to keep chunk | 0.2 (20%) |
+| `--vad-aggressiveness` | VAD level (0-3, higher=stricter) | 2 |
+
+---
 
 ## Model Selection
 
@@ -78,8 +200,8 @@ python run.py train --model base --unfreeze --manifest ./processed/manifest.csv
 # Bangla model, unfrozen (maximum quality)
 python run.py train --model bangla --unfreeze --manifest ./processed/manifest.csv
 
-# Resume from checkpoint
-python run.py train --model bangla --manifest ./processed/manifest.csv --resume ./output/epoch_7
+# Resume from checkpoint (specify correct epoch for old checkpoints)
+python run.py train --model bangla --manifest ./processed/manifest.csv --resume ./output/epoch_7 --start-epoch 8
 
 # With Weights & Biases logging
 python run.py train --model bangla --manifest ./processed/manifest.csv --wandb
@@ -97,47 +219,6 @@ Settings are automatically adjusted based on `--model` and `--unfreeze` flags:
 | Speed | ~50 min/epoch | ~24 hrs/epoch | ~50 min/epoch | ~24 hrs/epoch |
 
 All model presets are defined in `config.py` under `MODEL_PRESETS`.
-
-## Installation
-
-```bash
-# Clone or copy the project
-cd bangla_asr
-
-# install uv
-curl -LsSf https://astral.sh/uv/install.sh | sh  # Linux/Mac
-# or: powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"  # Windows
-
-# Create virtual environment
-uv venv venv
-source venv/bin/activate  # Linux/Mac
-# or: venv\Scripts\activate  # Windows
-
-# Install dependencies
-uv pip install -r requirements.txt
-
-# Optional: Install FFmpeg for faster audio loading
-sudo apt install ffmpeg  # Linux/WSL
-```
-
-## Project Structure
-
-```
-bangla_asr/
-├── data                # Raw data
-├── output              # Training weights & checkpoints
-├── processed           # Preprocessed data
-├── config.py           # All configurations & MODEL_PRESETS
-├── prepare_data.py     # Dataset preparation & splitting
-├── preprocessing.py    # Audio preprocessing & VAD
-├── augmentation.py     # Training augmentations
-├── dataset.py          # Dataset & vocabulary classes
-├── train.py            # Training script
-├── inference.py        # Inference & submission
-├── run.py              # CLI wrapper
-├── requirements.txt    # Dependencies
-└── README.md           # This file
-```
 
 ## Pipeline Overview
 
@@ -278,6 +359,40 @@ AudioConfig:
 
 ## Troubleshooting
 
+### FFmpeg Not Found
+```bash
+# Ubuntu/Debian
+sudo apt update && sudo apt install ffmpeg
+
+# macOS
+brew install ffmpeg
+
+# Windows
+choco install ffmpeg
+# or download from https://ffmpeg.org/download.html
+
+# Verify
+ffmpeg -version
+```
+
+### webrtcvad Not Available
+```bash
+# Linux/Mac
+pip install webrtcvad
+
+# Windows (pre-built)
+pip install webrtcvad-wheels
+```
+
+### YouTube Download Errors
+```bash
+# Update yt-dlp to latest version
+pip install -U yt-dlp
+
+# If JavaScript runtime warning appears (optional fix)
+sudo apt install nodejs  # or install deno
+```
+
 ### Out of Memory
 ```python
 # In config.py, reduce batch size:
@@ -297,8 +412,9 @@ gradient_accumulation_steps: 8  # Increase to maintain effective batch
 
 ### Resume Issues
 ```bash
-# Resume from specific checkpoint
-python run.py train --model bangla --manifest ./processed/manifest.csv --resume ./output/epoch_7
+# Resume from specific checkpoint with epoch override
+python run.py train --model bangla --manifest ./processed/manifest.csv \
+    --resume ./output/best --start-epoch 8
 ```
 
 ## Command Reference
@@ -310,6 +426,7 @@ python run.py train --model bangla --manifest ./processed/manifest.csv --resume 
 | `python run.py train` | Train the model |
 | `python run.py infer` | Run inference on audio |
 | `python run.py submit` | Generate submission file |
+| `python run.py youtube` | Download YouTube audio with lyrics |
 
 ### Train Command Options
 
@@ -321,7 +438,20 @@ python run.py train --model bangla --manifest ./processed/manifest.csv --resume 
 | `--manifest` | Path to manifest CSV | Required |
 | `--output-dir` | Output directory | ./output |
 | `--resume` | Checkpoint to resume from | None |
+| `--start-epoch` | Override start epoch when resuming | Auto |
 | `--wandb` | Enable W&B logging | False |
+
+### YouTube Command Options
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--url`, `-u` | YouTube video URL | Required |
+| `--output`, `-o` | Output directory | ./youtube_data |
+| `--genius-token` | Genius API token (optional) | None |
+| `--min-chunk` | Min chunk duration (seconds) | 10.0 |
+| `--max-chunk` | Max chunk duration (seconds) | 15.0 |
+| `--min-speech-ratio` | Min speech ratio to keep chunk | 0.2 |
+| `--vad-aggressiveness` | VAD level (0-3) | 2 |
 
 ## License
 

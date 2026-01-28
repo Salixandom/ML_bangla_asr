@@ -100,14 +100,18 @@ def train_command(args):
     cmd = [
         sys.executable, 'train.py',
         '--manifest', args.manifest,
-        '--output-dir', args.output_dir
+        '--output-dir', args.output_dir,
+        '--model', args.model
     ]
     
     if args.resume:
         cmd.extend(['--resume', args.resume])
     
-    if args.model:
-        cmd.extend(['--model', args.model])
+    if args.start_epoch is not None:
+        cmd.extend(['--start-epoch', str(args.start_epoch)])
+    
+    if args.unfreeze:
+        cmd.append('--unfreeze')
     
     if args.use_pretrained_vocab:
         cmd.append('--use-pretrained-vocab')
@@ -159,6 +163,28 @@ def submit_command(args):
         use_postprocessing=not args.no_postprocess,
         device=args.device
     )
+
+
+def youtube_command(args):
+    """Process YouTube video for ASR training."""
+    from youtube_processor import YouTubeProcessor
+    
+    processor = YouTubeProcessor(
+        output_dir=args.output,
+        chunk_min_duration=args.min_chunk,
+        chunk_max_duration=args.max_chunk,
+        min_speech_ratio=args.min_speech_ratio,
+        vad_aggressiveness=args.vad_aggressiveness,
+        genius_token=args.genius_token
+    )
+    
+    result = processor.process(url=args.url)
+    
+    if result['success']:
+        print(f"\n🎉 Successfully processed {result['num_chunks']} chunks")
+        print(f"   {result['chunks_with_lyrics']} chunks have aligned lyrics")
+    else:
+        print(f"\n❌ Processing failed: {result.get('message', 'Unknown error')}")
 
 
 def demo_command(args):
@@ -278,11 +304,15 @@ Examples:
     train_parser.add_argument('--manifest', type=str, required=True, help='Processed manifest CSV')
     train_parser.add_argument('--output-dir', type=str, default='./output', help='Output directory')
     train_parser.add_argument('--resume', type=str, help='Checkpoint to resume from')
-    train_parser.add_argument('--model', type=str, default=None,
-                             choices=['base', 'bangla', None],
-                             help='Model to use: "base" (facebook/w2v-bert-2.0) or "bangla" (sazzadul/Shrutimala_Bangla_ASR)')
+    train_parser.add_argument('--start-epoch', type=int, default=None,
+                             help='Override start epoch when resuming (for old checkpoints)')
+    train_parser.add_argument('--model', type=str, default='base',
+                             choices=['base', 'bangla'],
+                             help='Model: "base" or "bangla"')
+    train_parser.add_argument('--unfreeze', action='store_true',
+                             help='Unfreeze all encoder layers (slower but potentially better)')
     train_parser.add_argument('--use-pretrained-vocab', action='store_true',
-                             help='Use vocabulary from pretrained model (recommended for Bangla models)')
+                             help='Use vocabulary from pretrained model')
     train_parser.add_argument('--wandb', action='store_true', help='Use W&B logging')
     train_parser.add_argument('--wandb-project', type=str, default='bangla-asr', help='W&B project')
     
@@ -305,6 +335,16 @@ Examples:
     submit_parser.add_argument('--no-postprocess', action='store_true', help='Disable BanglaBERT')
     submit_parser.add_argument('--device', type=str, default='cuda', help='Device')
     
+    # YouTube command
+    youtube_parser = subparsers.add_parser('youtube', help='Download YouTube audio and create training chunks')
+    youtube_parser.add_argument('--url', '-u', type=str, required=True, help='YouTube video URL')
+    youtube_parser.add_argument('--output', '-o', type=str, default='./youtube_data', help='Output directory')
+    youtube_parser.add_argument('--genius-token', type=str, default=None, help='Genius API token for lyrics fallback')
+    youtube_parser.add_argument('--min-chunk', type=float, default=10.0, help='Min chunk duration (seconds)')
+    youtube_parser.add_argument('--max-chunk', type=float, default=15.0, help='Max chunk duration (seconds)')
+    youtube_parser.add_argument('--min-speech-ratio', type=float, default=0.2, help='Min speech ratio (0.2=20%%)')
+    youtube_parser.add_argument('--vad-aggressiveness', type=int, default=2, choices=[0,1,2,3], help='VAD level')
+    
     # Demo command
     demo_parser = subparsers.add_parser('demo', help='Run pipeline demo')
     
@@ -320,6 +360,8 @@ Examples:
         infer_command(args)
     elif args.command == 'submit':
         submit_command(args)
+    elif args.command == 'youtube':
+        youtube_command(args)
     elif args.command == 'demo':
         demo_command(args)
     else:

@@ -17,6 +17,9 @@ pydub>=0.25.0
 resampy>=0.4.0  # Required by librosa for resampling
 webrtcvad
 
+# Youtube audio download
+yt-dlp
+
 # Data handling
 numpy>=1.24.0
 pandas>=2.0.0
