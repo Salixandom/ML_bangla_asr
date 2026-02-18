@@ -4,11 +4,12 @@ Audio Preprocessing Module for Bangla ASR Pipeline
 Steps:
 1. MP3 → PCM waveform decoding
 2. Resampling to 16 kHz
-3. Loudness normalization (LUFS)
-4. Amplitude normalization [-1, 1]
-5. Voice Activity Detection
-6. Speech segmentation
-7. Chunking
+3. DC offset removal
+4. Voice Activity Detection
+5. Speech segmentation
+6. Loudness normalization (LUFS) - per segment
+7. Amplitude normalization [-1, 1] - per segment
+8. Chunking
 
 All steps are deterministic and applied to ALL splits.
 
@@ -154,6 +155,15 @@ class AudioPreprocessor:
         """
         Complete preprocessing pipeline for a single audio file.
         
+        New order:
+        1. Load audio
+        2. Resample to 16kHz
+        3. DC offset removal
+        4. VAD + segmentation (on raw audio)
+        5. Loudness normalization (per segment)
+        6. Amplitude normalization (per segment)
+        7. Chunking
+        
         Args:
             audio_path: Path to audio file (MP3, WAV, etc.)
             
@@ -162,7 +172,7 @@ class AudioPreprocessor:
         """
         audio_path = Path(audio_path)
         
-        # Step 1: Load and decode audio (using torchaudio for speed)
+        # Step 1: Load and decode audio
         waveform, original_sr = self._load_audio(audio_path)
         original_duration = len(waveform) / original_sr
         
@@ -170,17 +180,14 @@ class AudioPreprocessor:
         if original_sr != self.audio_config.sample_rate:
             waveform = self.gpu_resampler.resample(waveform, original_sr)
         
-        # Step 3: Loudness normalization
-        waveform = self._normalize_loudness(waveform)
+        # Step 3: DC offset removal
+        waveform = self._remove_dc_offset(waveform)
         
-        # Step 4: Amplitude normalization
-        waveform = self._normalize_amplitude(waveform)
-        
-        # Step 5 & 6: VAD and speech segmentation
+        # Step 4 & 5: VAD and speech segmentation (on raw audio before normalization)
         segments = self._extract_speech_segments(waveform)
         
-        # Step 7: Chunking
-        chunks = self._chunk_segments(segments)
+        # Step 6, 7 & 8: Normalize segments and create chunks
+        chunks = self._normalize_and_chunk_segments(segments)
         
         processed_duration = sum(len(c[0]) for c in chunks) / self.audio_config.sample_rate
         
@@ -227,10 +234,19 @@ class AudioPreprocessor:
             else:
                 raise RuntimeError(f"Could not load {audio_path}: {e}")
     
+    def _remove_dc_offset(self, waveform: np.ndarray) -> np.ndarray:
+        """
+        Step 3: Remove DC offset from waveform.
+        DC offset can bias VAD decisions and cause issues with some audio processing.
+        """
+        dc_offset = np.mean(waveform)
+        waveform = waveform - dc_offset
+        return waveform.astype(np.float32)
+    
     def _normalize_loudness(self, waveform: np.ndarray) -> np.ndarray:
         """
-        Step 3: Normalize loudness to target LUFS (-23 LUFS default).
-        Removes recording-device loudness bias.
+        Step 6: Normalize loudness to target LUFS (-23 LUFS default).
+        Applied per-segment after VAD to avoid normalizing silence/noise.
         """
         # Measure current loudness
         current_loudness = self.meter.integrated_loudness(waveform)
@@ -249,7 +265,8 @@ class AudioPreprocessor:
     
     def _normalize_amplitude(self, waveform: np.ndarray) -> np.ndarray:
         """
-        Step 4: Normalize waveform amplitude to [-1, 1].
+        Step 7: Normalize waveform amplitude to [-1, 1].
+        Applied per-segment after loudness normalization.
         Prevents numerical instability.
         """
         max_val = np.abs(waveform).max()
@@ -259,7 +276,8 @@ class AudioPreprocessor:
     
     def _extract_speech_segments(self, waveform: np.ndarray) -> List[SpeechSegment]:
         """
-        Steps 5 & 6: VAD + speech segment extraction.
+        Steps 4 & 5: VAD + speech segment extraction.
+        Applied on raw audio (after DC offset removal) for better accuracy.
         """
         if self.vad is not None:
             return self._webrtc_vad_segments(waveform)
@@ -393,13 +411,16 @@ class AudioPreprocessor:
         
         return segments
     
-    def _chunk_segments(
+    def _normalize_and_chunk_segments(
         self, 
         segments: List[SpeechSegment]
     ) -> List[Tuple[np.ndarray, float, float]]:
         """
-        Step 7: Chunk speech segments into fixed-length windows.
-        Handles long utterances by splitting with overlap.
+        Steps 6, 7 & 8: Normalize each segment and chunk into fixed-length windows.
+        
+        - Step 6: Loudness normalization (per segment)
+        - Step 7: Amplitude normalization (per segment)  
+        - Step 8: Chunking with overlap for long segments
         """
         sr = self.audio_config.sample_rate
         min_samples = int(self.audio_config.chunk_min_duration * sr)
@@ -409,9 +430,17 @@ class AudioPreprocessor:
         chunks = []
         
         for segment in segments:
-            audio = segment.audio
+            # Get segment audio
+            audio = segment.audio.copy()
             segment_start = segment.start
             
+            # Step 6: Loudness normalization (per segment)
+            audio = self._normalize_loudness(audio)
+            
+            # Step 7: Amplitude normalization (per segment)
+            audio = self._normalize_amplitude(audio)
+            
+            # Step 8: Chunking
             if len(audio) <= max_samples:
                 # Segment fits in one chunk
                 if len(audio) >= min_samples:
@@ -436,6 +465,16 @@ class AudioPreprocessor:
                         break
         
         return chunks
+    
+    def _chunk_segments(
+        self, 
+        segments: List[SpeechSegment]
+    ) -> List[Tuple[np.ndarray, float, float]]:
+        """
+        Legacy method - use _normalize_and_chunk_segments instead.
+        Kept for backward compatibility.
+        """
+        return self._normalize_and_chunk_segments(segments)
     
     def process_for_model(
         self, 
