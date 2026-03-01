@@ -30,6 +30,7 @@ __pycache__/
 *.log
 logs/
 *.txt
+*.csv
 
 # Archives
 *.zip
