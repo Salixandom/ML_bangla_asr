@@ -8,6 +8,9 @@ Complete inference including:
 4. Batch evaluation on manifest CSV (WER, CER, per-sample comparison)
 
 Supports both greedy and beam search decoding.
+
+Terminal output is kept ASCII-safe (no Bangla text printed).
+All Bangla output goes to UTF-8 files that any text editor or Excel can open.
 """
 
 import torch
@@ -27,11 +30,13 @@ from train import Wav2VecBertCTCModel, CTCDecoder
 from postprocessor import BanglaBERTPostProcessor
 
 
-# Global feature extractor (cached)
+# ---------------------------------------------------------------------------
+# Feature extractor (cached globally — heavy to init)
+# ---------------------------------------------------------------------------
+
 _FEATURE_EXTRACTOR = None
 
 def get_feature_extractor(sample_rate: int = 16000) -> SeamlessM4TFeatureExtractor:
-    """Get or create the feature extractor for wav2vec-BERT 2.0."""
     global _FEATURE_EXTRACTOR
     if _FEATURE_EXTRACTOR is None:
         _FEATURE_EXTRACTOR = SeamlessM4TFeatureExtractor.from_pretrained(
@@ -40,6 +45,10 @@ def get_feature_extractor(sample_rate: int = 16000) -> SeamlessM4TFeatureExtract
         )
     return _FEATURE_EXTRACTOR
 
+
+# ---------------------------------------------------------------------------
+# Metric helpers
+# ---------------------------------------------------------------------------
 
 def compute_wer(predictions: list, references: list) -> float:
     import jiwer
@@ -58,7 +67,7 @@ def compute_cer(predictions: list, references: list) -> float:
 
 
 def compute_wer_details(prediction: str, reference: str) -> dict:
-    """Per-sample WER with insertion/deletion/substitution breakdown."""
+    """Per-sample WER with insertion / deletion / substitution counts."""
     import jiwer
     if not reference.strip():
         return {'wer': 0.0, 'insertions': 0, 'deletions': 0,
@@ -74,14 +83,18 @@ def compute_wer_details(prediction: str, reference: str) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Main inference class
+# ---------------------------------------------------------------------------
+
 class ASRInference:
     """
     Complete ASR inference pipeline.
 
-    Usage:
-        inference = ASRInference.from_checkpoint('path/to/checkpoint')
-        result    = inference.transcribe('audio.mp3')
-        metrics   = inference.evaluate('processed/manifest.csv', split='valid')
+    Typical usage:
+        asr = ASRInference.from_checkpoint('output/best')
+        asr.transcribe('audio.mp3')                     # → <stem>_transcription.txt
+        asr.evaluate('processed/manifest.csv')           # → eval_valid_*.txt / .csv
     """
 
     def __init__(
@@ -109,25 +122,31 @@ class ASRInference:
     def from_checkpoint(
         cls,
         checkpoint_dir: Union[str, Path],
-        use_postprocessing: bool = True,
+        use_postprocessing: bool = False,
         device: str = "cuda"
     ) -> "ASRInference":
+        """
+        Load inference pipeline from a saved checkpoint directory.
+
+        Args:
+            checkpoint_dir:    Path to checkpoint (contains pytorch_model.bin,
+                               vocabulary.json, etc.)
+            use_postprocessing: Load and enable BanglaBERT 2-stage corrector.
+                               Off by default — pass --postprocess in CLI to enable.
+            device:            'cuda' or 'cpu'
+        """
         checkpoint_dir = Path(checkpoint_dir)
         config = get_config()
 
+        # Vocabulary
         vocab = BanglaVocabulary(config.tokenizer)
         vocab_path = checkpoint_dir / 'vocabulary.json'
         if vocab_path.exists():
             vocab = BanglaVocabulary.load(vocab_path, config.tokenizer)
 
-        # FIX: Disable freezing at inference time.
-        # Wav2VecBertCTCModel.__init__ calls _freeze_feature_encoder() when
-        # config.model.freeze_feature_encoder=True, which sets requires_grad=False
-        # on half the encoder. Freezing is a training optimisation — at inference
-        # all parameters are already inside torch.no_grad() so grad computation
-        # never happens anyway. But the freeze printout ("Feature projection frozen",
-        # "Frozen first 12/24 encoder layers") is misleading and the unnecessary
-        # attribute writes slow down model loading slightly.
+        # Freezing is a training optimisation only. At inference all forward
+        # passes are wrapped in torch.no_grad() — freezing is a no-op and only
+        # prints misleading "Frozen first 12/24 encoder layers" messages.
         config.model.freeze_feature_encoder = False
 
         model = Wav2VecBertCTCModel(
@@ -136,24 +155,20 @@ class ASRInference:
             pretrained_name=str(checkpoint_dir)
         )
 
-        # During inference, never drop audio based on duration.
-        # chunk_min_duration is a training-time filter to avoid noise clips
-        # in the dataset. At inference time it would silently return an empty
-        # transcription for any audio shorter than the threshold.
-        # Setting it to 0.0 keeps every VAD segment regardless of length.
+        # Never drop audio by duration at inference time. chunk_min_duration
+        # is a training filter to discard noise clips. Leaving it non-zero
+        # would silently return an empty string for any short clip.
         config.audio.chunk_min_duration = 0.0
 
         preprocessor = AudioPreprocessor(config.audio, config.vad)
         decoder      = CTCDecoder(vocab)
 
-        # FIX: from_checkpoint() creates a fresh config internally (defaults
-        # use_banglabert_correction=False). The use_postprocessing argument is
-        # the caller's intent — honour it directly instead of requiring the
-        # config default to also be True.
+        # Honour use_postprocessing directly — from_checkpoint() creates a
+        # fresh config where use_banglabert_correction=False by default, so
+        # we must sync the flag before checking it.
         postprocessor = None
         if use_postprocessing:
             config.inference.use_banglabert_correction = True
-        if use_postprocessing and config.inference.use_banglabert_correction:
             try:
                 postprocessor = BanglaBERTPostProcessor(
                     discriminator_model=config.inference.banglabert_discriminator_model,
@@ -172,9 +187,9 @@ class ASRInference:
             config=config.inference, device=device
         )
 
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
     # Core transcription
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
 
     @torch.no_grad()
     def transcribe(
@@ -183,7 +198,19 @@ class ASRInference:
         return_chunks: bool = False,
         use_postprocessing: bool = True,
     ) -> Union[str, Dict]:
-        processed = self.preprocessor.process_file(audio_path)
+        """
+        Transcribe a single audio file.
+
+        Args:
+            audio_path:        Path to any audio format supported by librosa
+            return_chunks:     If True, return dict with per-chunk timestamps
+            use_postprocessing: Apply BanglaBERT correction (if loaded)
+
+        Returns:
+            Transcribed string, or dict {'text', 'chunks', 'duration'} when
+            return_chunks=True
+        """
+        processed         = self.preprocessor.process_file(audio_path)
         feature_extractor = get_feature_extractor(processed.sample_rate)
 
         all_transcriptions = []
@@ -196,46 +223,44 @@ class ASRInference:
                 return_tensors="pt",
                 padding=False
             )
-            input_features = features.input_features.to(self.device)
-
-            outputs = self.model(input_features=input_features)
-            logits  = outputs['logits']
+            logits = self.model(
+                input_features=features.input_features.to(self.device)
+            )['logits']
 
             if self.config.decoding_method == 'beam':
-                transcription = self.decoder.decode_beam(
-                    logits, beam_width=self.config.beam_width
-                )[0]
+                text = self.decoder.decode_beam(logits, beam_width=self.config.beam_width)[0]
             else:
-                transcription = self.decoder.decode_greedy(logits)[0]
+                text = self.decoder.decode_greedy(logits)[0]
 
-            all_transcriptions.append(transcription)
+            all_transcriptions.append(text)
             if return_chunks:
-                chunk_results.append({'start': start_time, 'end': end_time, 'text': transcription})
+                chunk_results.append({'start': start_time, 'end': end_time, 'text': text})
 
-        full_transcription = ' '.join(all_transcriptions)
+        full_text = ' '.join(all_transcriptions)
 
         if use_postprocessing and self.postprocessor is not None:
-            full_transcription = self.postprocessor.correct(full_transcription)
+            full_text = self.postprocessor.correct(full_text)
             if return_chunks:
-                for chunk in chunk_results:
-                    chunk['text_corrected'] = self.postprocessor.correct(chunk['text'])
+                for c in chunk_results:
+                    c['text_corrected'] = self.postprocessor.correct(c['text'])
 
         if return_chunks:
-            return {'text': full_transcription, 'chunks': chunk_results,
+            return {'text': full_text, 'chunks': chunk_results,
                     'duration': processed.original_duration}
-        return full_transcription
+        return full_text
 
     def transcribe_batch(
         self,
         audio_paths: List[Union[str, Path]],
         use_postprocessing: bool = True,
     ) -> List[str]:
+        """Transcribe a list of audio files, returning a list of strings."""
         results = []
-        for audio_path in tqdm(audio_paths, desc="Transcribing"):
+        for p in tqdm(audio_paths, desc="Transcribing"):
             try:
-                results.append(self.transcribe(audio_path, use_postprocessing=use_postprocessing))
+                results.append(self.transcribe(p, use_postprocessing=use_postprocessing))
             except Exception as e:
-                print(f"Error processing {audio_path}: {e}")
+                print(f"Error processing {p}: {e}")
                 results.append("")
         return results
 
@@ -246,55 +271,65 @@ class ASRInference:
         file_extension: str = '.mp3',
         use_postprocessing: bool = True,
     ) -> pd.DataFrame:
+        """Transcribe all audio files in a directory and save to CSV."""
         audio_dir   = Path(audio_dir)
         audio_files = list(audio_dir.glob(f'*{file_extension}'))
         print(f"Found {len(audio_files)} audio files")
 
-        results = []
-        for audio_path in tqdm(audio_files, desc="Transcribing"):
+        records = []
+        for p in tqdm(audio_files, desc="Transcribing"):
             try:
-                text = self.transcribe(audio_path, use_postprocessing=use_postprocessing)
-                results.append({'id': audio_path.stem, 'sentence': text})
+                text = self.transcribe(p, use_postprocessing=use_postprocessing)
+                records.append({'id': p.stem, 'sentence': text})
             except Exception as e:
-                print(f"Error processing {audio_path}: {e}")
-                results.append({'id': audio_path.stem, 'sentence': ""})
+                print(f"Error processing {p}: {e}")
+                records.append({'id': p.stem, 'sentence': ""})
 
-        df = pd.DataFrame(results)
-        df.to_csv(output_csv, index=False)
+        df = pd.DataFrame(records)
+        df.to_csv(output_csv, index=False, encoding='utf-8-sig')
         print(f"Results saved to {output_csv}")
         return df
 
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
     # Batch evaluation on manifest CSV
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
 
     def evaluate(
         self,
         manifest_path: Union[str, Path],
         split: str = 'valid',
-        output_csv: Optional[Union[str, Path]] = None,
+        output_prefix: Optional[Union[str, Path]] = None,
         use_postprocessing: bool = True,
         num_samples: Optional[int] = None,
-        verbose: bool = True,
     ) -> Dict:
         """
-        Run batch evaluation on a manifest CSV and report WER / CER.
+        Evaluate WER / CER on a manifest CSV split and write results to files.
 
-        The manifest CSV must have columns:
-            audio_path  — path to chunk WAV file
-            sentence    — reference transcription
-            split       — 'train' / 'valid' / 'test'
+        Always writes three output files (all UTF-8 — open in any editor or Excel):
+            <prefix>_summary.txt      — overall metrics, distribution, worst-10
+            <prefix>_per_sample.txt   — every REF/PRED pair, sorted worst → best
+            <prefix>_per_sample.csv   — full spreadsheet (utf-8-sig for Excel)
+
+        The default prefix is  eval_<split>  in the current directory, so running:
+            asr.evaluate('processed/manifest.csv')
+        produces:
+            eval_valid_summary.txt
+            eval_valid_per_sample.txt
+            eval_valid_per_sample.csv
 
         Args:
             manifest_path:     Path to processed/manifest.csv
-            split:             Which split to evaluate
-            output_csv:        Optional path to save per-sample CSV results
+            split:             'valid' (default), 'train', or 'test'
+            output_prefix:     Base path for the three output files.
+                               e.g. 'results/run1' →
+                                   results/run1_summary.txt
+                                   results/run1_per_sample.txt
+                                   results/run1_per_sample.csv
             use_postprocessing: Apply BanglaBERT correction before scoring
-            num_samples:       Cap evaluation at N samples (None = all)
-            verbose:           Print REF/PRED for every sample
+            num_samples:       Evaluate only first N samples (None = all)
 
         Returns:
-            dict with wer, cer, error counts, and results_df (per-sample DataFrame)
+            dict with wer, cer, error counts, file paths, and results_df
         """
         manifest_path = Path(manifest_path)
         df = pd.read_csv(manifest_path)
@@ -313,18 +348,28 @@ class ASRInference:
             df = df.head(num_samples)
             print(f"Limiting to first {num_samples} samples")
 
-        audio_col = 'audio_path' if 'audio_path' in df.columns else 'path'
-        ref_col   = 'sentence'
+        audio_col  = 'audio_path' if 'audio_path' in df.columns else 'path'
+        ref_col    = 'sentence'
+        post_label = 'BanglaBERT' if use_postprocessing and self.postprocessor else 'disabled'
 
-        print(f"\nRunning inference on {len(df)} samples...")
-        print(f"Post-processing: {'✅ BanglaBERT' if use_postprocessing and self.postprocessor else '❌ disabled'}")
-        print(f"Decoding:        {self.config.decoding_method}")
+        # Resolve output file paths
+        base = Path(output_prefix) if output_prefix else Path(f"eval_{split}")
+        base.parent.mkdir(parents=True, exist_ok=True)
+        summary_txt    = Path(str(base) + "_summary.txt")
+        per_sample_txt = Path(str(base) + "_per_sample.txt")
+        per_sample_csv = Path(str(base) + "_per_sample.csv")
+
+        print(f"\nPost-processing : {post_label}")
+        print(f"Decoding        : {self.config.decoding_method}")
+        print(f"Output prefix   : {base}")
         print()
 
-        records   = []
-        all_preds = []
-        all_refs  = []
-
+        # ---------------------------------------------------------------
+        # Inference loop
+        # ---------------------------------------------------------------
+        records         = []
+        all_preds       = []
+        all_refs        = []
         total_ins = total_del = total_sub = 0
         total_ref_words = total_hyp_words = 0
 
@@ -335,121 +380,178 @@ class ASRInference:
 
             prediction = ""
             error_msg  = ""
-
             try:
                 prediction = self.transcribe(
-                    audio_path,
-                    use_postprocessing=use_postprocessing,
+                    audio_path, use_postprocessing=use_postprocessing
                 )
             except Exception as e:
                 error_msg = str(e)
-                tqdm.write(f"  ⚠️  Error on {sample_id}: {e}")
+                tqdm.write(f"  ERROR [{sample_id}]: {e}")
 
-            details = compute_wer_details(prediction, reference)
-
+            d = compute_wer_details(prediction, reference)
             all_preds.append(prediction)
             all_refs.append(reference)
 
-            total_ins       += details['insertions']
-            total_del       += details['deletions']
-            total_sub       += details['substitutions']
-            total_ref_words += details['ref_words']
-            total_hyp_words += details['hyp_words']
+            total_ins       += d['insertions']
+            total_del       += d['deletions']
+            total_sub       += d['substitutions']
+            total_ref_words += d['ref_words']
+            total_hyp_words += d['hyp_words']
 
             records.append({
                 'id':            sample_id,
                 'audio_path':    str(audio_path),
                 'reference':     reference,
                 'prediction':    prediction,
-                'wer':           round(details['wer'], 4),
-                'insertions':    details['insertions'],
-                'deletions':     details['deletions'],
-                'substitutions': details['substitutions'],
-                'ref_words':     details['ref_words'],
-                'hyp_words':     details['hyp_words'],
+                'wer':           round(d['wer'], 4),
+                'insertions':    d['insertions'],
+                'deletions':     d['deletions'],
+                'substitutions': d['substitutions'],
+                'ref_words':     d['ref_words'],
+                'hyp_words':     d['hyp_words'],
                 'error':         error_msg,
             })
-
-            if verbose:
-                icon = "✅" if details['wer'] == 0.0 else ("⚠️ " if details['wer'] < 0.3 else "❌")
-                tqdm.write(f"  [{idx+1}/{len(df)}] {icon} WER={details['wer']:.3f}  id={sample_id}")
-                tqdm.write(f"    REF:  {reference}")
-                tqdm.write(f"    PRED: {prediction}")
-                tqdm.write("")
 
         corpus_wer = compute_wer(all_preds, all_refs)
         corpus_cer = compute_cer(all_preds, all_refs)
 
-        results_df = pd.DataFrame(records).sort_values('wer', ascending=False).reset_index(drop=True)
-
-        if output_csv:
-            output_csv = Path(output_csv)
-            output_csv.parent.mkdir(parents=True, exist_ok=True)
-            results_df.to_csv(output_csv, index=False, encoding='utf-8-sig')
-            print(f"\n📄 Per-sample results saved to: {output_csv}")
-
-        sep = "=" * 60
-        print(f"\n{sep}")
-        print(f"EVALUATION RESULTS  —  split={split}  ({len(df)} samples)")
-        print(f"{sep}")
-        print(f"  WER:              {corpus_wer:.4f}  ({corpus_wer*100:.2f}%)")
-        print(f"  CER:              {corpus_cer:.4f}  ({corpus_cer*100:.2f}%)")
-        print(f"  Insertions:       {total_ins}")
-        print(f"  Deletions:        {total_del}")
-        print(f"  Substitutions:    {total_sub}")
-        print(f"  Total ref words:  {total_ref_words}")
-        print(f"  Total hyp words:  {total_hyp_words}")
-
+        results_df = (
+            pd.DataFrame(records)
+            .sort_values('wer', ascending=False)
+            .reset_index(drop=True)
+        )
         wer_vals = results_df['wer']
-        print(f"\n  Per-sample WER distribution:")
-        print(f"    Min:             {wer_vals.min():.4f}")
-        print(f"    Median:          {wer_vals.median():.4f}")
-        print(f"    Mean:            {wer_vals.mean():.4f}")
-        print(f"    Max:             {wer_vals.max():.4f}")
-        print(f"    Perfect (WER=0): {(wer_vals == 0).sum()} / {len(df)}")
 
-        print(f"\n  Worst 10 samples:")
+        # ---------------------------------------------------------------
+        # Write per-sample CSV (utf-8-sig BOM lets Excel open Bangla correctly)
+        # ---------------------------------------------------------------
+        results_df.to_csv(per_sample_csv, index=False, encoding='utf-8-sig')
+
+        # ---------------------------------------------------------------
+        # Build summary block (shared between txt file and terminal print)
+        # ---------------------------------------------------------------
+        sep = "=" * 65
+        summary_lines = [
+            sep,
+            f"EVALUATION SUMMARY  —  split={split}  ({len(df)} samples)",
+            sep,
+            f"  Decoding        : {self.config.decoding_method}",
+            f"  Post-processing : {post_label}",
+            "",
+            f"  WER             : {corpus_wer:.4f}  ({corpus_wer*100:.2f}%)",
+            f"  CER             : {corpus_cer:.4f}  ({corpus_cer*100:.2f}%)",
+            "",
+            f"  Insertions      : {total_ins}",
+            f"  Deletions       : {total_del}",
+            f"  Substitutions   : {total_sub}",
+            f"  Total ref words : {total_ref_words}",
+            f"  Total hyp words : {total_hyp_words}",
+            "",
+            f"  Per-sample WER distribution:",
+            f"    Min             : {wer_vals.min():.4f}",
+            f"    Median          : {wer_vals.median():.4f}",
+            f"    Mean            : {wer_vals.mean():.4f}",
+            f"    Max             : {wer_vals.max():.4f}",
+            f"    Perfect (WER=0) : {(wer_vals == 0).sum()} / {len(df)}"
+            f"  ({100*(wer_vals==0).sum()/len(df):.1f}%)",
+            "",
+            "  Worst 10 samples:",
+        ]
         for _, r in results_df.head(10).iterrows():
-            print(f"    [{r['id']}]  WER={r['wer']:.3f}")
-            print(f"      REF:  {r['reference']}")
-            print(f"      PRED: {r['prediction']}")
+            summary_lines.append(f"    [{r['id']}]  WER={r['wer']:.3f}")
+            summary_lines.append(f"      REF:  {r['reference']}")
+            summary_lines.append(f"      PRED: {r['prediction']}")
+        summary_lines += [
+            "",
+            "  Output files:",
+            f"    {summary_txt}",
+            f"    {per_sample_txt}",
+            f"    {per_sample_csv}",
+            sep,
+        ]
+
+        # ---------------------------------------------------------------
+        # Write summary txt
+        # ---------------------------------------------------------------
+        summary_txt.write_text("\n".join(summary_lines) + "\n", encoding='utf-8')
+
+        # ---------------------------------------------------------------
+        # Write per-sample detail txt  (sorted worst → best)
+        # ---------------------------------------------------------------
+        header = [
+            sep,
+            f"PER-SAMPLE DETAIL  —  split={split}  ({len(df)} samples)",
+            "Sorted worst → best by WER",
+            sep,
+            "",
+        ]
+        detail_lines = []
+        for rank, (_, r) in enumerate(results_df.iterrows(), 1):
+            icon = "OK " if r['wer'] == 0.0 else ("WRN" if r['wer'] < 0.3 else "ERR")
+            detail_lines.append(
+                f"[{rank:>6}/{len(df)}] {icon} WER={r['wer']:.3f}  id={r['id']}\n"
+                f"  REF:  {r['reference']}\n"
+                f"  PRED: {r['prediction']}\n"
+            )
+        per_sample_txt.write_text(
+            "\n".join(header + detail_lines), encoding='utf-8'
+        )
+
+        # ---------------------------------------------------------------
+        # Terminal — metrics only (no Bangla text, safe for any terminal)
+        # ---------------------------------------------------------------
+        print(f"\n{sep}")
+        print(f"EVALUATION COMPLETE  —  split={split}  ({len(df)} samples)")
+        print(f"{sep}")
+        print(f"  WER  : {corpus_wer:.4f}  ({corpus_wer*100:.2f}%)")
+        print(f"  CER  : {corpus_cer:.4f}  ({corpus_cer*100:.2f}%)")
+        print(f"  Ins  : {total_ins}   Del : {total_del}   Sub : {total_sub}")
+        print(f"  Perfect (WER=0) : {(wer_vals==0).sum()} / {len(df)}")
+        print()
+        print("  Open these files to see full results in Bangla:")
+        print(f"    Summary     -> {summary_txt}")
+        print(f"    Per-sample  -> {per_sample_txt}")
+        print(f"    Spreadsheet -> {per_sample_csv}")
         print(f"{sep}\n")
 
         return {
-            'wer':                 corpus_wer,
-            'cer':                 corpus_cer,
-            'total_insertions':    total_ins,
-            'total_deletions':     total_del,
-            'total_substitutions': total_sub,
-            'total_ref_words':     total_ref_words,
-            'total_hyp_words':     total_hyp_words,
-            'num_samples':         len(df),
-            'results_df':          results_df,
+            'wer':                  corpus_wer,
+            'cer':                  corpus_cer,
+            'total_insertions':     total_ins,
+            'total_deletions':      total_del,
+            'total_substitutions':  total_sub,
+            'total_ref_words':      total_ref_words,
+            'total_hyp_words':      total_hyp_words,
+            'num_samples':          len(df),
+            'results_df':           results_df,
+            'summary_txt':          summary_txt,
+            'per_sample_txt':       per_sample_txt,
+            'per_sample_csv':       per_sample_csv,
         }
 
 
-# -------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Competition submission
-# -------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
 def generate_submission(
     checkpoint_dir: Union[str, Path],
     test_audio_dir: Union[str, Path],
     sample_submission_path: Union[str, Path],
     output_path: Union[str, Path],
-    use_postprocessing: bool = True,
+    use_postprocessing: bool = False,
     device: str = "cuda"
 ) -> pd.DataFrame:
+    """Generate competition submission CSV from test audio directory."""
     inference = ASRInference.from_checkpoint(
         checkpoint_dir, use_postprocessing=use_postprocessing, device=device
     )
 
     sample_df = pd.read_csv(sample_submission_path)
-    test_ids  = sample_df['id'].tolist()
     test_dir  = Path(test_audio_dir)
 
     results = []
-    for test_id in tqdm(test_ids, desc="Generating submission"):
+    for test_id in tqdm(sample_df['id'].tolist(), desc="Generating submission"):
         audio_path = None
         for ext in ['.mp3', '.wav', '.flac']:
             candidate = test_dir / f"{test_id}{ext}"
@@ -458,7 +560,7 @@ def generate_submission(
                 break
 
         if audio_path is None:
-            print(f"Warning: Audio not found for {test_id}")
+            print(f"Warning: audio not found for {test_id}")
             results.append({'id': test_id, 'sentence': ''})
             continue
 
@@ -466,59 +568,81 @@ def generate_submission(
             text = inference.transcribe(audio_path, use_postprocessing=use_postprocessing)
             results.append({'id': test_id, 'sentence': text})
         except Exception as e:
-            print(f"Error processing {test_id}: {e}")
+            print(f"Error on {test_id}: {e}")
             results.append({'id': test_id, 'sentence': ''})
 
     submission_df = pd.DataFrame(results)
-    submission_df.to_csv(output_path, index=False)
+    # utf-8-sig so Excel opens the Bangla column correctly
+    submission_df.to_csv(output_path, index=False, encoding='utf-8-sig')
     print(f"Submission saved to {output_path}")
     return submission_df
 
 
-# -------------------------------------------------------------------------
-# CLI
-# -------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# CLI  (subcommands: evaluate | transcribe | submit)
+# ---------------------------------------------------------------------------
 
 def main():
     import argparse
 
-    parser     = argparse.ArgumentParser(description='Bangla ASR Inference & Evaluation')
+    parser     = argparse.ArgumentParser(
+        description='Bangla ASR — Inference & Evaluation',
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
     subparsers = parser.add_subparsers(dest='mode')
 
-    # ---- evaluate ----
-    ep = subparsers.add_parser('evaluate', help='Evaluate WER/CER on manifest split')
-    ep.add_argument('--checkpoint',   required=True, help='Checkpoint directory')
-    ep.add_argument('--manifest',     required=True, help='Path to processed/manifest.csv')
-    ep.add_argument('--split',        default='valid',
-                    help="Which split to evaluate: 'valid' (default), 'train', 'test'")
-    ep.add_argument('--output',       default=None,
-                    help='Save per-sample results to this CSV (sorted worst→best)')
-    ep.add_argument('--num-samples',  type=int, default=None,
-                    help='Limit to first N samples')
-    ep.add_argument('--postprocess',  action='store_true',
-                    help='Enable BanglaBERT post-processing')
-    ep.add_argument('--beam-search',  action='store_true')
-    ep.add_argument('--beam-width',   type=int, default=100)
-    ep.add_argument('--device',       default='cuda')
-    ep.add_argument('--no-verbose',   action='store_true',
-                    help='Only print summary, suppress per-sample REF/PRED')
+    # ---- evaluate --------------------------------------------------------
+    ep = subparsers.add_parser(
+        'evaluate',
+        help='Evaluate WER/CER on a manifest split, write results to files'
+    )
+    ep.add_argument('--checkpoint',    required=True,
+                    help='Path to model checkpoint directory')
+    ep.add_argument('--manifest',      required=True,
+                    help='Path to processed/manifest.csv')
+    ep.add_argument('--split',         default='valid',
+                    help="Split to evaluate: 'valid' (default), 'train', 'test'")
+    ep.add_argument('--output-prefix', default=None,
+                    help=(
+                        "Base path for output files.\n"
+                        "e.g. --output-prefix results/run1  produces:\n"
+                        "  results/run1_summary.txt\n"
+                        "  results/run1_per_sample.txt\n"
+                        "  results/run1_per_sample.csv\n"
+                        "Default: eval_<split> in current directory."
+                    ))
+    ep.add_argument('--num-samples',   type=int, default=None,
+                    help='Evaluate only first N samples')
+    ep.add_argument('--postprocess',   action='store_true',
+                    help='Enable BanglaBERT 2-stage correction')
+    ep.add_argument('--beam-search',   action='store_true',
+                    help='Use beam search decoding (default: greedy)')
+    ep.add_argument('--beam-width',    type=int, default=100)
+    ep.add_argument('--device',        default='cuda')
 
-    # ---- transcribe ----
-    tp = subparsers.add_parser('transcribe', help='Transcribe audio file(s)')
+    # ---- transcribe ------------------------------------------------------
+    tp = subparsers.add_parser(
+        'transcribe',
+        help='Transcribe one audio file or a directory of files'
+    )
     tp.add_argument('--checkpoint',  required=True)
-    tp.add_argument('--audio',       default=None, help='Single audio file')
-    tp.add_argument('--audio-dir',   default=None, help='Directory of audio files')
-    tp.add_argument('--output',      default='transcription.csv',
-                      help='Output path. For --audio: saves a .txt file. '
-                           'For --audio-dir: saves a .csv. '
-                           'Default for --audio: <audio_stem>_transcription.txt')
-    tp.add_argument('--postprocess', action='store_true')
+    tp.add_argument('--audio',       default=None,
+                    help='Single audio file → writes <stem>_transcription.txt')
+    tp.add_argument('--audio-dir',   default=None,
+                    help='Directory of audio files → writes CSV')
+    tp.add_argument('--output',      default=None,
+                    help='Custom output path (optional)')
+    tp.add_argument('--postprocess', action='store_true',
+                    help='Enable BanglaBERT correction')
     tp.add_argument('--beam-search', action='store_true')
     tp.add_argument('--beam-width',  type=int, default=100)
     tp.add_argument('--device',      default='cuda')
 
-    # ---- submit ----
-    sp = subparsers.add_parser('submit', help='Generate competition submission CSV')
+    # ---- submit ----------------------------------------------------------
+    sp = subparsers.add_parser(
+        'submit',
+        help='Generate competition submission CSV from test audio directory'
+    )
     sp.add_argument('--checkpoint',        required=True)
     sp.add_argument('--test-dir',          required=True)
     sp.add_argument('--sample-submission', required=True)
@@ -532,44 +656,50 @@ def main():
         parser.print_help()
         return
 
+    # Shared config tweaks
     config = get_config()
     if getattr(args, 'beam_search', False):
         config.inference.decoding_method = 'beam'
         config.inference.beam_width      = args.beam_width
-    if getattr(args, 'postprocess', False):
-        config.inference.use_banglabert_correction = True
 
+    # ---- evaluate --------------------------------------------------------
     if args.mode == 'evaluate':
-        inference = ASRInference.from_checkpoint(
-            args.checkpoint, use_postprocessing=args.postprocess, device=args.device
+        asr = ASRInference.from_checkpoint(
+            args.checkpoint,
+            use_postprocessing=args.postprocess,
+            device=args.device,
         )
-        inference.evaluate(
+        asr.evaluate(
             manifest_path=args.manifest,
             split=args.split,
-            output_csv=args.output,
+            output_prefix=args.output_prefix,
             use_postprocessing=args.postprocess,
             num_samples=args.num_samples,
-            verbose=not args.no_verbose,
         )
 
+    # ---- transcribe ------------------------------------------------------
     elif args.mode == 'transcribe':
-        inference = ASRInference.from_checkpoint(
-            args.checkpoint, use_postprocessing=args.postprocess, device=args.device
+        asr = ASRInference.from_checkpoint(
+            args.checkpoint,
+            use_postprocessing=args.postprocess,
+            device=args.device,
         )
-        if args.audio:
-            result = inference.transcribe(
-                args.audio, return_chunks=True, use_postprocessing=args.postprocess
-            )
-            audio_stem = Path(args.audio).stem
-            out_path   = Path(args.output) if args.output != 'transcription.csv'                          else Path(f"{audio_stem}_transcription.txt")
 
-            # Write to txt — Windows terminal doesn't render Bangla Unicode
+        if args.audio:
+            result   = asr.transcribe(
+                args.audio, return_chunks=True,
+                use_postprocessing=args.postprocess,
+            )
+            stem     = Path(args.audio).stem
+            out_path = Path(args.output) if args.output \
+                       else Path(f"{stem}_transcription.txt")
+
             lines = [
-                f"File:     {args.audio}",
-                f"Duration: {result['duration']:.2f}s",
-                f"Chunks:   {len(result['chunks'])}",
-                f"Decoding: {inference.config.decoding_method}",
-                f"Post-processing: {'BanglaBERT' if inference.postprocessor else 'disabled'}",
+                f"File            : {args.audio}",
+                f"Duration        : {result['duration']:.2f}s",
+                f"Chunks          : {len(result['chunks'])}",
+                f"Decoding        : {asr.config.decoding_method}",
+                f"Post-processing : {'BanglaBERT' if asr.postprocessor else 'disabled'}",
                 "",
                 "--- TRANSCRIPTION ---",
                 result['text'],
@@ -577,23 +707,27 @@ def main():
             ]
             if len(result['chunks']) > 1:
                 lines.append("--- CHUNK BREAKDOWN ---")
-                for i, chunk in enumerate(result['chunks']):
-                    lines.append(f"[{chunk['start']:.2f}s - {chunk['end']:.2f}s]  {chunk['text']}")
+                for c in result['chunks']:
+                    lines.append(
+                        f"[{c['start']:.2f}s - {c['end']:.2f}s]  {c['text']}"
+                    )
 
             out_path.write_text("\n".join(lines), encoding='utf-8')
-            print(f"\n✅ Transcription saved to: {out_path}")
-            print(f"   Duration: {result['duration']:.2f}s  |  Chunks: {len(result['chunks'])}")
-            # Print ASCII-safe summary; full Bangla text is in the file
-            print(f"   (Open the .txt file to read the Bangla transcription)")
+            print(f"\nTranscription saved to: {out_path}")
+            print(f"Duration : {result['duration']:.2f}s  |  Chunks : {len(result['chunks'])}")
+            print("(Open the .txt file to read the Bangla text)")
+
         elif args.audio_dir:
-            inference.transcribe_dataset(
+            out = Path(args.output) if args.output else Path("transcriptions.csv")
+            asr.transcribe_dataset(
                 audio_dir=args.audio_dir,
-                output_csv=args.output,
+                output_csv=out,
                 use_postprocessing=args.postprocess,
             )
         else:
             print("Please specify --audio or --audio-dir")
 
+    # ---- submit ----------------------------------------------------------
     elif args.mode == 'submit':
         generate_submission(
             checkpoint_dir=args.checkpoint,
