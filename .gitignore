@@ -1,0 +1,11 @@
+/data
+/processed
+/output
+/cache
+/venv
+/models
+*.rar
+*.zip
+__pycache__/
+*.pyc
+/cache
