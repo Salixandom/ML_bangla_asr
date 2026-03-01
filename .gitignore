@@ -1,11 +1,43 @@
-/data
-/processed
-/output
-/cache
-/venv
-/models
-*.rar
-*.zip
+# Data
+/data/
+/processed/
+/output/
+/models/
+/cache/
+
+# Environment
+/venv/
+.env
+
+# Python
 __pycache__/
 *.pyc
-/cache
+*.pyo
+*.pyd
+
+# ML checkpoints
+*.pt
+*.bin
+*.ckpt
+*.npy
+
+# Audio
+*.wav
+*.mp3
+*.flac
+
+# Logs
+*.log
+logs/
+*.txt
+
+# Archives
+*.zip
+*.rar
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
