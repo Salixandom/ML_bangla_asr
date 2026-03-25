@@ -50,9 +50,38 @@ def get_feature_extractor(sample_rate: int = 16000) -> SeamlessM4TFeatureExtract
 # Metric helpers
 # ---------------------------------------------------------------------------
 
+import re
+import unicodedata
+
+# Bangla punctuation + common ASCII punctuation to strip before WER/CER.
+# Keeping Bangla characters, digits, and whitespace; removing everything else.
+
+_STRIP_PUNCT = re.compile(
+    r"""[!"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~।॥‘’“”…–—]""",
+    flags=re.UNICODE,
+)
+
+
+def normalize_for_wer(text: str) -> str:
+    """
+    Normalise text before WER/CER scoring:
+      1. Unicode NFC normalisation
+      2. Strip punctuation (Bangla danda, ASCII punct, smart quotes)
+      3. Collapse multiple spaces
+      4. Lower-case (no-op for Bangla, safe for mixed scripts)
+    Punctuation is irrelevant to speech recognition accuracy and inflates
+    error rates when the model and reference use different conventions.
+    """
+    text = unicodedata.normalize('NFC', text)
+    text = _STRIP_PUNCT.sub(' ', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text.lower()
+
+
 def compute_wer(predictions: list, references: list) -> float:
     import jiwer
-    pairs = [(p, r) for p, r in zip(predictions, references) if r.strip()]
+    pairs = [(normalize_for_wer(p), normalize_for_wer(r))
+             for p, r in zip(predictions, references) if r.strip()]
     if not pairs:
         return 0.0
     return jiwer.wer([r for _, r in pairs], [p for p, _ in pairs])
@@ -60,26 +89,30 @@ def compute_wer(predictions: list, references: list) -> float:
 
 def compute_cer(predictions: list, references: list) -> float:
     import jiwer
-    pairs = [(p, r) for p, r in zip(predictions, references) if r.strip()]
+    pairs = [(normalize_for_wer(p), normalize_for_wer(r))
+             for p, r in zip(predictions, references) if r.strip()]
     if not pairs:
         return 0.0
     return jiwer.cer([r for _, r in pairs], [p for p, _ in pairs])
 
 
 def compute_wer_details(prediction: str, reference: str) -> dict:
-    """Per-sample WER with insertion / deletion / substitution counts."""
+    """Per-sample WER with insertion / deletion / substitution counts.
+    Both strings are normalised (punctuation stripped) before scoring."""
     import jiwer
-    if not reference.strip():
+    pred_n = normalize_for_wer(prediction)
+    ref_n  = normalize_for_wer(reference)
+    if not ref_n:
         return {'wer': 0.0, 'insertions': 0, 'deletions': 0,
                 'substitutions': 0, 'ref_words': 0, 'hyp_words': 0}
-    out = jiwer.process_words(reference, prediction)
+    out = jiwer.process_words(ref_n, pred_n)
     return {
         'wer':           out.wer,
         'insertions':    out.insertions,
         'deletions':     out.deletions,
         'substitutions': out.substitutions,
-        'ref_words':     len(reference.split()),
-        'hyp_words':     len(prediction.split()),
+        'ref_words':     len(ref_n.split()),
+        'hyp_words':     len(pred_n.split()),
     }
 
 
@@ -93,8 +126,8 @@ class ASRInference:
 
     Typical usage:
         asr = ASRInference.from_checkpoint('output/best')
-        asr.transcribe('audio.mp3')                     # → <stem>_transcription.txt
-        asr.evaluate('processed/manifest.csv')           # → eval_valid_*.txt / .csv
+        asr.transcribe('audio.mp3')                      # → <stem>_transcription.txt
+        asr.evaluate('processed/manifest.csv')            # → eval_valid_*.txt / .csv
     """
 
     def __init__(
@@ -129,23 +162,19 @@ class ASRInference:
         Load inference pipeline from a saved checkpoint directory.
 
         Args:
-            checkpoint_dir:    Path to checkpoint (contains pytorch_model.bin,
-                               vocabulary.json, etc.)
-            use_postprocessing: Load and enable BanglaBERT 2-stage corrector.
-                               Off by default — pass --postprocess in CLI to enable.
-            device:            'cuda' or 'cpu'
+            checkpoint_dir:     Path to checkpoint directory
+            use_postprocessing: Load BanglaBERT corrector (pass --postprocess in CLI)
+            device:             'cuda' or 'cpu'
         """
         checkpoint_dir = Path(checkpoint_dir)
         config = get_config()
 
-        # Vocabulary
         vocab = BanglaVocabulary(config.tokenizer)
         vocab_path = checkpoint_dir / 'vocabulary.json'
         if vocab_path.exists():
             vocab = BanglaVocabulary.load(vocab_path, config.tokenizer)
 
-        # Freezing is a training optimisation only. At inference all forward
-        # passes are wrapped in torch.no_grad() — freezing is a no-op and only
+        # Freezing is a training optimisation — pointless at inference and
         # prints misleading "Frozen first 12/24 encoder layers" messages.
         config.model.freeze_feature_encoder = False
 
@@ -155,17 +184,15 @@ class ASRInference:
             pretrained_name=str(checkpoint_dir)
         )
 
-        # Never drop audio by duration at inference time. chunk_min_duration
-        # is a training filter to discard noise clips. Leaving it non-zero
-        # would silently return an empty string for any short clip.
+        # Never drop audio by duration at inference — chunk_min_duration is a
+        # training filter; leaving it non-zero silently returns empty strings.
         config.audio.chunk_min_duration = 0.0
 
         preprocessor = AudioPreprocessor(config.audio, config.vad)
         decoder      = CTCDecoder(vocab)
 
-        # Honour use_postprocessing directly — from_checkpoint() creates a
-        # fresh config where use_banglabert_correction=False by default, so
-        # we must sync the flag before checking it.
+        # Honour use_postprocessing directly — fresh config has
+        # use_banglabert_correction=False by default.
         postprocessor = None
         if use_postprocessing:
             config.inference.use_banglabert_correction = True
@@ -188,7 +215,7 @@ class ASRInference:
         )
 
     # -----------------------------------------------------------------------
-    # Core transcription
+    # Core transcription  (for raw/unseen audio — runs full preprocessing)
     # -----------------------------------------------------------------------
 
     @torch.no_grad()
@@ -201,14 +228,9 @@ class ASRInference:
         """
         Transcribe a single audio file.
 
-        Args:
-            audio_path:        Path to any audio format supported by librosa
-            return_chunks:     If True, return dict with per-chunk timestamps
-            use_postprocessing: Apply BanglaBERT correction (if loaded)
-
-        Returns:
-            Transcribed string, or dict {'text', 'chunks', 'duration'} when
-            return_chunks=True
+        Runs the full preprocessing pipeline (resample, VAD, normalize).
+        Use this for raw MP3/WAV files, NOT for manifest chunks which are
+        already preprocessed — those go through evaluate() which skips this.
         """
         processed         = self.preprocessor.process_file(audio_path)
         feature_extractor = get_feature_extractor(processed.sample_rate)
@@ -297,48 +319,43 @@ class ASRInference:
     def evaluate(
         self,
         manifest_path: Union[str, Path],
-        split: str = 'valid',
+        split: Optional[str] = 'valid',  # None = evaluate all splits
         output_prefix: Optional[Union[str, Path]] = None,
         use_postprocessing: bool = True,
         num_samples: Optional[int] = None,
     ) -> Dict:
         """
-        Evaluate WER / CER on a manifest CSV split and write results to files.
+        Evaluate WER / CER on a manifest CSV and write results to files.
 
-        Always writes three output files (all UTF-8 — open in any editor or Excel):
-            <prefix>_summary.txt      — overall metrics, distribution, worst-10
-            <prefix>_per_sample.txt   — every REF/PRED pair, sorted worst → best
-            <prefix>_per_sample.csv   — full spreadsheet (utf-8-sig for Excel)
+        Manifest chunks are already preprocessed WAVs from run.py preprocess,
+        so this skips the preprocessing pipeline entirely — just sf.read() +
+        feature extractor + model forward pass.
 
-        The default prefix is  eval_<split>  in the current directory, so running:
-            asr.evaluate('processed/manifest.csv')
-        produces:
-            eval_valid_summary.txt
-            eval_valid_per_sample.txt
-            eval_valid_per_sample.csv
+        Writes three UTF-8 output files (open in any editor or Excel):
+            <prefix>_summary.txt      — metrics, distribution, worst-10
+            <prefix>_per_sample.txt   — every REF/PRED pair, sorted worst→best
+            <prefix>_per_sample.csv   — spreadsheet (utf-8-sig BOM for Excel)
 
         Args:
             manifest_path:     Path to processed/manifest.csv
-            split:             'valid' (default), 'train', or 'test'
-            output_prefix:     Base path for the three output files.
-                               e.g. 'results/run1' →
-                                   results/run1_summary.txt
-                                   results/run1_per_sample.txt
-                                   results/run1_per_sample.csv
-            use_postprocessing: Apply BanglaBERT correction before scoring
-            num_samples:       Evaluate only first N samples (None = all)
-
-        Returns:
-            dict with wer, cer, error counts, file paths, and results_df
+            split:             'valid' (default), 'train', 'test', or
+                               None to evaluate the entire manifest regardless
+                               of the split column.
+            output_prefix:     Base path for output files.
+                               Default: eval_<split> or eval_all.
+            use_postprocessing: Apply BanglaBERT correction before scoring.
+            num_samples:       Evaluate only first N samples (None = all).
         """
         manifest_path = Path(manifest_path)
         df = pd.read_csv(manifest_path)
 
-        if 'split' in df.columns:
+        if split is None:
+            print(f"Evaluating all splits: {len(df)} samples")
+        elif 'split' in df.columns:
             df = df[df['split'] == split].reset_index(drop=True)
             print(f"Evaluating on '{split}' split: {len(df)} samples")
         else:
-            print(f"No 'split' column — evaluating all {len(df)} samples")
+            print(f"No 'split' column in manifest — evaluating all {len(df)} samples")
 
         if len(df) == 0:
             print(f"No samples found for split='{split}'")
@@ -351,9 +368,9 @@ class ASRInference:
         audio_col  = 'audio_path' if 'audio_path' in df.columns else 'path'
         ref_col    = 'sentence'
         post_label = 'BanglaBERT' if use_postprocessing and self.postprocessor else 'disabled'
+        split_label = split or 'all'
 
-        # Resolve output file paths
-        base = Path(output_prefix) if output_prefix else Path(f"eval_{split}")
+        base = Path(output_prefix) if output_prefix else Path(f"eval_{split_label}")
         base.parent.mkdir(parents=True, exist_ok=True)
         summary_txt    = Path(str(base) + "_summary.txt")
         per_sample_txt = Path(str(base) + "_per_sample.txt")
@@ -364,26 +381,71 @@ class ASRInference:
         print(f"Output prefix   : {base}")
         print()
 
-        # ---------------------------------------------------------------
-        # Inference loop
-        # ---------------------------------------------------------------
+        # Open per-sample txt immediately and stream each result as it arrives
+        sep = "=" * 65
+        _txt_f = per_sample_txt.open('w', encoding='utf-8')
+        _txt_f.write(sep + "\n")
+        _txt_f.write(f"PER-SAMPLE DETAIL  —  split={split_label}  ({len(df)} samples)\n")
+        _txt_f.write(sep + "\n\n")
+
+        feature_extractor = get_feature_extractor()
+
         records         = []
         all_preds       = []
         all_refs        = []
         total_ins = total_del = total_sub = 0
         total_ref_words = total_hyp_words = 0
 
+        FLUSH_EVERY = 1000   # write incremental CSV every N samples
+
+        # Write CSV header immediately so the file exists from the start
+        pd.DataFrame(columns=[
+            'id', 'audio_path', 'reference', 'prediction',
+            'wer', 'insertions', 'deletions', 'substitutions',
+            'ref_words', 'hyp_words', 'error'
+        ]).to_csv(per_sample_csv, index=False, encoding='utf-8-sig')
+
+        pending = []   # buffer between flushes
+
+        def flush_pending():
+            """Append pending records to the CSV on disk and clear the buffer."""
+            if not pending:
+                return
+            pd.DataFrame(pending).to_csv(
+                per_sample_csv, mode='a', header=False,
+                index=False, encoding='utf-8-sig'
+            )
+            pending.clear()
+
         for idx, row in tqdm(df.iterrows(), total=len(df), desc="Evaluating"):
             audio_path = Path(row[audio_col])
             reference  = str(row[ref_col]).strip() if pd.notna(row[ref_col]) else ""
-            sample_id  = row.get('id', row.get('original_id', str(idx)))
+            sample_id  = str(row.get('id', row.get('original_id', idx)))
 
             prediction = ""
             error_msg  = ""
             try:
-                prediction = self.transcribe(
-                    audio_path, use_postprocessing=use_postprocessing
+                # Chunks in the manifest are already preprocessed WAVs —
+                # read directly, no resampling/VAD/normalization needed.
+                audio, sr = sf.read(audio_path, dtype='float32', always_2d=False)
+                if audio.ndim > 1:
+                    audio = audio.mean(axis=1)
+                feats = feature_extractor(
+                    audio, sampling_rate=sr,
+                    return_tensors="pt", padding=False
                 )
+                with torch.no_grad():
+                    logits = self.model(
+                        input_features=feats.input_features.to(self.device)
+                    )['logits']
+                if self.config.decoding_method == 'beam':
+                    prediction = self.decoder.decode_beam(
+                        logits, beam_width=self.config.beam_width
+                    )[0]
+                else:
+                    prediction = self.decoder.decode_greedy(logits)[0]
+                if use_postprocessing and self.postprocessor is not None:
+                    prediction = self.postprocessor.correct(prediction)
             except Exception as e:
                 error_msg = str(e)
                 tqdm.write(f"  ERROR [{sample_id}]: {e}")
@@ -398,7 +460,7 @@ class ASRInference:
             total_ref_words += d['ref_words']
             total_hyp_words += d['hyp_words']
 
-            records.append({
+            record = {
                 'id':            sample_id,
                 'audio_path':    str(audio_path),
                 'reference':     reference,
@@ -410,30 +472,37 @@ class ASRInference:
                 'ref_words':     d['ref_words'],
                 'hyp_words':     d['hyp_words'],
                 'error':         error_msg,
-            })
+            }
+            records.append(record)
+            pending.append(record)
+
+            # Stream this result to per_sample txt immediately
+            tag = "OK " if d['wer'] == 0.0 else ("WRN" if d['wer'] < 0.3 else "ERR")
+            _txt_f.write(
+                f"[{idx+1}/{len(df)}] {tag} WER={d['wer']:.3f}  id={sample_id}\n"
+                f"  REF:  {reference}\n"
+                f"  PRED: {prediction}\n\n"
+            )
+
+            # Flush to disk every FLUSH_EVERY samples so the buffer never
+            # grows large enough to exhaust RAM on 200k+ sample runs.
+            if len(pending) >= FLUSH_EVERY:
+                flush_pending()
+
+        # Flush remaining CSV buffer and close per-sample txt
+        flush_pending()
+        _txt_f.close()
 
         corpus_wer = compute_wer(all_preds, all_refs)
         corpus_cer = compute_cer(all_preds, all_refs)
 
-        results_df = (
-            pd.DataFrame(records)
-            .sort_values('wer', ascending=False)
-            .reset_index(drop=True)
-        )
-        wer_vals = results_df['wer']
+        results_df = pd.DataFrame(records)
+        wer_vals   = results_df['wer']
 
-        # ---------------------------------------------------------------
-        # Write per-sample CSV (utf-8-sig BOM lets Excel open Bangla correctly)
-        # ---------------------------------------------------------------
-        results_df.to_csv(per_sample_csv, index=False, encoding='utf-8-sig')
-
-        # ---------------------------------------------------------------
-        # Build summary block (shared between txt file and terminal print)
-        # ---------------------------------------------------------------
-        sep = "=" * 65
+        # Summary txt
         summary_lines = [
             sep,
-            f"EVALUATION SUMMARY  —  split={split}  ({len(df)} samples)",
+            f"EVALUATION SUMMARY  —  split={split_label}  ({len(df)} samples)",
             sep,
             f"  Decoding        : {self.config.decoding_method}",
             f"  Post-processing : {post_label}",
@@ -447,7 +516,7 @@ class ASRInference:
             f"  Total ref words : {total_ref_words}",
             f"  Total hyp words : {total_hyp_words}",
             "",
-            f"  Per-sample WER distribution:",
+            "  Per-sample WER distribution:",
             f"    Min             : {wer_vals.min():.4f}",
             f"    Median          : {wer_vals.median():.4f}",
             f"    Mean            : {wer_vals.mean():.4f}",
@@ -469,39 +538,13 @@ class ASRInference:
             f"    {per_sample_csv}",
             sep,
         ]
-
-        # ---------------------------------------------------------------
-        # Write summary txt
-        # ---------------------------------------------------------------
         summary_txt.write_text("\n".join(summary_lines) + "\n", encoding='utf-8')
 
-        # ---------------------------------------------------------------
-        # Write per-sample detail txt  (sorted worst → best)
-        # ---------------------------------------------------------------
-        header = [
-            sep,
-            f"PER-SAMPLE DETAIL  —  split={split}  ({len(df)} samples)",
-            "Sorted worst → best by WER",
-            sep,
-            "",
-        ]
-        detail_lines = []
-        for rank, (_, r) in enumerate(results_df.iterrows(), 1):
-            icon = "OK " if r['wer'] == 0.0 else ("WRN" if r['wer'] < 0.3 else "ERR")
-            detail_lines.append(
-                f"[{rank:>6}/{len(df)}] {icon} WER={r['wer']:.3f}  id={r['id']}\n"
-                f"  REF:  {r['reference']}\n"
-                f"  PRED: {r['prediction']}\n"
-            )
-        per_sample_txt.write_text(
-            "\n".join(header + detail_lines), encoding='utf-8'
-        )
+        # per_sample_txt was written incrementally during the loop — nothing to do here
 
-        # ---------------------------------------------------------------
-        # Terminal — metrics only (no Bangla text, safe for any terminal)
-        # ---------------------------------------------------------------
+        # Terminal — no Bangla text
         print(f"\n{sep}")
-        print(f"EVALUATION COMPLETE  —  split={split}  ({len(df)} samples)")
+        print(f"EVALUATION COMPLETE  —  split={split_label}  ({len(df)} samples)")
         print(f"{sep}")
         print(f"  WER  : {corpus_wer:.4f}  ({corpus_wer*100:.2f}%)")
         print(f"  CER  : {corpus_cer:.4f}  ({corpus_cer*100:.2f}%)")
@@ -572,7 +615,6 @@ def generate_submission(
             results.append({'id': test_id, 'sentence': ''})
 
     submission_df = pd.DataFrame(results)
-    # utf-8-sig so Excel opens the Bangla column correctly
     submission_df.to_csv(output_path, index=False, encoding='utf-8-sig')
     print(f"Submission saved to {output_path}")
     return submission_df
@@ -602,6 +644,8 @@ def main():
                     help='Path to processed/manifest.csv')
     ep.add_argument('--split',         default='valid',
                     help="Split to evaluate: 'valid' (default), 'train', 'test'")
+    ep.add_argument('--all-splits',    action='store_true',
+                    help='Ignore split column — evaluate the entire manifest')
     ep.add_argument('--output-prefix', default=None,
                     help=(
                         "Base path for output files.\n"
@@ -609,7 +653,7 @@ def main():
                         "  results/run1_summary.txt\n"
                         "  results/run1_per_sample.txt\n"
                         "  results/run1_per_sample.csv\n"
-                        "Default: eval_<split> in current directory."
+                        "Default: eval_<split> or eval_all."
                     ))
     ep.add_argument('--num-samples',   type=int, default=None,
                     help='Evaluate only first N samples')
@@ -656,7 +700,6 @@ def main():
         parser.print_help()
         return
 
-    # Shared config tweaks
     config = get_config()
     if getattr(args, 'beam_search', False):
         config.inference.decoding_method = 'beam'
@@ -671,7 +714,7 @@ def main():
         )
         asr.evaluate(
             manifest_path=args.manifest,
-            split=args.split,
+            split=None if args.all_splits else args.split,
             output_prefix=args.output_prefix,
             use_postprocessing=args.postprocess,
             num_samples=args.num_samples,
